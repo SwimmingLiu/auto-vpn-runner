@@ -1,0 +1,292 @@
+name: Cloudflare Subscription
+
+# The scheduled half of the AutoVPN Cloudflare deployment.
+#
+# The pipeline code lives in `swimmingliu/auto-vpn`; this repository owns the
+# schedule, the credentials and the run history. The checkout below is pinned to
+# one commit of that repository so a night cannot be changed by an in-flight
+# branch, and moving the pin is a reviewed change here.
+#
+# The crawl runs on this runner, not in a Cloudflare Container: Containers need
+# the Workers Paid plan, while everything else works on the free plan and a
+# runner is a Linux box with Docker, Node and a public IP. Egress is unchanged:
+# the crawl goes out through the nodes in the already-published subscription,
+# never through the runner's own address.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Measure only; do not publish'
+        type: boolean
+        default: false
+  schedule:
+    # 20:15 UTC — the slot the source server publishes on, so the two never
+    # race for the same night.
+    - cron: '15 20 * * *'
+
+permissions:
+  contents: read
+
+# A publish replaces the whole Pages production deployment, so two runs must
+# never overlap.
+concurrency:
+  group: cloudflare-subscription
+  cancel-in-progress: false
+
+env:
+  NPM_CONFIG_REGISTRY: "https://registry.npmjs.org/"
+  NPM_CONFIG_AUDIT: "false"
+  NPM_CONFIG_FUND: "false"
+  MIHOMO_VERSION: "v1.19.34"
+  # The auto-vpn commit whose CLI is measured. Move this deliberately; the
+  # workflow and the CLI must come from the same commit.
+  PIPELINE_REF: "61c61755575ae78c6b347b7ac5e4a77edd7bafe0"
+
+jobs:
+  publish:
+    name: Measure and publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    # No `environment:`: this repository owns these credentials outright, so
+    # they live as repository secrets and variables. An environment here would
+    # hide any secret added at repository level behind a scope this job never
+    # enters, which reads as an empty secret at deploy time.
+    defaults:
+      run:
+        working-directory: source
+    steps:
+      - name: Checkout the pipeline
+        uses: actions/checkout@v4
+        with:
+          repository: swimmingliu/auto-vpn
+          ref: ${{ env.PIPELINE_REF }}
+          path: source
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Check required configuration
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          SUB_URL: ${{ secrets.AUTOVPN_SUBSCRIPTION_URL }}
+        run: |
+          missing=0
+          check() { if [ -z "$2" ]; then echo "missing $1" >&2; missing=1; fi; }
+          check "secret CLOUDFLARE_API_TOKEN" "$CF_TOKEN"
+          check "variable CLOUDFLARE_ACCOUNT_ID" "$CF_ACCOUNT"
+          check "secret AUTOVPN_SUBSCRIPTION_URL" "$SUB_URL"
+          exit "$missing"
+
+      # The pool is credentials, so it lives in repository secrets. Split across
+      # parts because a single 57 KB secret cannot be rotated or inspected; the
+      # assembler refuses a truncated set by byte count and sha256.
+      - name: Assemble the account pool
+        env:
+          ACCOUNTS_PARTS: ${{ vars.ACCOUNTS_PARTS }}
+          ACCOUNTS_POOL_SHA256: ${{ vars.ACCOUNTS_POOL_SHA256 }}
+          ACCOUNTS_POOL_BYTES: ${{ vars.ACCOUNTS_POOL_BYTES }}
+          ACCOUNTS_PART_1: ${{ secrets.ACCOUNTS_PART_1 }}
+          ACCOUNTS_PART_2: ${{ secrets.ACCOUNTS_PART_2 }}
+        run: node cloudflare/scripts/assemble-account-pool.mjs "$RUNNER_TEMP/account-info.txt"
+
+      # Built from the pinned checkout, not installed from npm: a night depends
+      # on CLI behaviour that a published version may not carry yet, and the
+      # workflow and the CLI must be the same commit.
+      - name: Build the CLI from the pinned checkout
+        run: |
+          npm --prefix npm/autovpn-cli ci --no-audit --no-fund --ignore-scripts
+          npm --prefix npm/autovpn-cli run build
+          npm install -g --no-audit --no-fund --ignore-scripts ./npm/autovpn-cli
+          autovpn --version
+
+      - name: Install mihomo
+        run: |
+          cloudflare/scripts/fetch-mihomo.sh "$MIHOMO_VERSION"
+          install -m 0755 cloudflare/container/vendor/mihomo-linux-amd64 "$RUNNER_TEMP/mihomo"
+          "$RUNNER_TEMP/mihomo" -v
+
+      # The pool lives at `<runtime-root>/accounts.db`, resolved from
+      # VPN_AUTOMATION_RUNTIME_ROOT. Without it the import writes to
+      # `~/.auto-vpn` while the run reads `$RUNNER_TEMP/autovpn`, which is how a
+      # pool of 631 accounts imported cleanly and every source then reported
+      # "account pool has no active <brand> account".
+      - name: Import the account pool
+        env:
+          VPN_AUTOMATION_RUNTIME_ROOT: ${{ runner.temp }}/autovpn
+        run: |
+          autovpn accounts import "$RUNNER_TEMP/account-info.txt" \
+            --project-root "$RUNNER_TEMP/autovpn" --format auto --output jsonl > "$RUNNER_TEMP/import.jsonl"
+          node -e '
+            const fs = require("node:fs");
+            const line = fs.readFileSync(process.argv[1], "utf8").trim().split("\n").pop();
+            const result = JSON.parse(line);
+            console.log(`imported ${result.parsed}, pool ${result.stats?.total} total / ${result.stats?.active} active`);
+            if (!(result.parsed > 0)) { console.error("the pool imported zero rows"); process.exit(1); }
+            // A pool that imported but cannot lease is the same failure one step
+            // later, and it reads as "no accounts" from inside the crawl.
+            if (!(result.stats?.active > 0)) { console.error("the pool has no active accounts after import"); process.exit(1); }
+          ' "$RUNNER_TEMP/import.jsonl"
+
+      # Build the crawl egress before the measurement: the crawl must leave
+      # through a subscription node, not through the runner's own address. The
+      # supervisor process is what keeps mihomo alive, so it runs in the
+      # background for the rest of the job.
+      - name: Build the crawl egress from the published subscription
+        env:
+          SUBSCRIPTION_URL: ${{ secrets.AUTOVPN_SUBSCRIPTION_URL }}
+          MIHOMO_BIN: ${{ runner.temp }}/mihomo
+          EGRESS_DIR: ${{ runner.temp }}/egress
+        run: |
+          node cloudflare/scripts/egress-on-runner.mjs --serve > "$RUNNER_TEMP/egress.log" 2>&1 &
+          EGRESS_PID=$!
+          echo "EGRESS_PID=$EGRESS_PID" >> "$GITHUB_ENV"
+          # Wait for the line the script prints once a node reaches the vendor
+          # host, or for the process to die and say why. 120 s covers a slow
+          # health-check sweep; a dead supervisor exits the wait immediately
+          # instead of burning the full budget.
+          for _ in $(seq 1 60); do
+            grep -q "mihomo is listening" "$RUNNER_TEMP/egress.log" 2>/dev/null && break
+            kill -0 "$EGRESS_PID" 2>/dev/null || break
+            sleep 2
+          done
+          cat "$RUNNER_TEMP/egress.log"
+          grep -q "mihomo is listening" "$RUNNER_TEMP/egress.log"
+
+      - name: Measure
+        id: measure
+        env:
+          VPN_AUTOMATION_RUNTIME_ROOT: ${{ runner.temp }}/autovpn
+          VPN_AUTOMATION_PROFILE_PATH: ${{ github.workspace }}/source/cloudflare/container/profile.cloudflare.toml
+          VPN_AUTOMATION_PROXY_MODE: proxy
+          VPN_AUTOMATION_UPSTREAM_PROXY: http://127.0.0.1:7897
+          MIHOMO_BIN: ${{ runner.temp }}/mihomo
+          # The profile defers its key to this variable, and the obfuscate stage
+          # runs inside this step (after render), not only at publish.
+          VPN_AUTOMATION_SUBSCRIPTION_KEY: ${{ secrets.AUTOVPN_SUBSCRIPTION_KEY }}
+        run: |
+          set -o pipefail
+          autovpn run --project-root "$RUNNER_TEMP/autovpn" \
+            --skip-deploy --skip-verify --output jsonl \
+            | tee "$RUNNER_TEMP/run.jsonl" \
+            | grep --line-buffered -E '"(stage|summary|run_failed)"' || true
+          node -e '
+            const fs = require("node:fs");
+            const lines = fs.readFileSync(process.argv[1], "utf8").trim().split("\n");
+            let summary = null;
+            for (const line of lines) { try { const e = JSON.parse(line); if (e.type === "summary") summary = e; } catch {} }
+            if (!summary) { console.error("no summary event"); process.exit(1); }
+            if (summary.run_status !== "success") { console.error(summary.error ?? "run failed"); process.exit(1); }
+            const count = Number(summary.counts?.final_links ?? 0);
+            const profile = fs.readFileSync(process.argv[2], "utf8");
+            const floor = Number(/^\s*min_final_links\s*=\s*(\d+)/m.exec(profile)?.[1] ?? 0);
+            // The gate the source server and the Durable Object apply: publish
+            // only above the floor. `--skip-deploy` means the CLI never checks
+            // it, so the workflow does, and a held night is a successful night —
+            // a thin sweep must not replace a working subscription.
+            console.log(`final_links=${count} floor=${floor}`);
+            fs.appendFileSync(process.env.GITHUB_OUTPUT ?? "/dev/null", `held=${count <= floor}\nfinal_links=${count}\n`);
+          ' "$RUNNER_TEMP/run.jsonl" cloudflare/container/profile.cloudflare.toml
+
+      - name: Report a held night
+        if: ${{ steps.measure.outputs.held == 'true' }}
+        run: |
+          echo "::notice::final_links=${{ steps.measure.outputs.final_links }} did not clear the floor; nothing was published and the previous subscription stays in service"
+
+      - name: Publish
+        if: ${{ inputs.dry_run != true && steps.measure.outputs.held != 'true' }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          # `retry-stage` reads the profile again for `min_final_links`,
+          # `[deploy]` and `[worker_build]`.
+          VPN_AUTOMATION_RUNTIME_ROOT: ${{ runner.temp }}/autovpn
+          VPN_AUTOMATION_PROFILE_PATH: ${{ github.workspace }}/source/cloudflare/container/profile.cloudflare.toml
+          # The profile defers its key to this variable rather than committing
+          # it. `resolveSecretQuery` throws when the sentinel is set and this is
+          # empty, so a missing secret fails the publish instead of serving a
+          # subscription keyed by the sentinel.
+          VPN_AUTOMATION_SUBSCRIPTION_KEY: ${{ secrets.AUTOVPN_SUBSCRIPTION_KEY }}
+          # The share worker's ADMIN token, same reasoning: no hardcoded
+          # fallback remains in the CLI.
+          VPN_AUTOMATION_PAGES_SECRET_ADMIN: ${{ secrets.AUTOVPN_PAGES_ADMIN }}
+        run: |
+          ARTIFACT="$(ls -dt "$RUNNER_TEMP"/autovpn/artifacts/* | head -1)"
+          echo "ARTIFACT=$ARTIFACT" >> "$GITHUB_ENV"
+          # The deploy stage is the CLI's own: it obfuscates, bundles and
+          # uploads the exact artifact this run measured.
+          autovpn retry-stage --project-root "$RUNNER_TEMP/autovpn" \
+            --artifact-dir "$ARTIFACT" --stage deploy --output jsonl \
+            > "$RUNNER_TEMP/deploy.jsonl" 2>&1 || true
+          node -e '
+            const fs = require("node:fs");
+            const lines = fs.readFileSync(process.argv[1], "utf8").trim().split("\n");
+            let summary = null;
+            for (const line of lines) { try { const e = JSON.parse(line); if (e.type === "summary") summary = e; } catch {} }
+            if (!summary) { console.error("no summary in the deploy log"); process.exit(1); }
+            const d = summary.deployment ?? {};
+            console.log(`deploy rc=${d.returncode} project=${d.project_name} url=${d.pages_project_url}`);
+            // The project and URL are read back from the deploy, not assumed.
+            fs.appendFileSync(process.env.GITHUB_ENV, `DEPLOY_URL=${d.pages_project_url}\n`);
+            if (summary.run_status !== "success" || Number(d.returncode ?? 1) !== 0) {
+              console.error(summary.error ?? "the deploy stage failed");
+              process.exit(1);
+            }
+          ' "$RUNNER_TEMP/deploy.jsonl"
+
+      # A 200 is not success: a wrong key and a stale deployment answer 200 too.
+      # Decode the body and require this run's own links to be in it.
+      - name: Verify what is actually served
+        if: ${{ inputs.dry_run != true && steps.measure.outputs.held != 'true' }}
+        env:
+          # The profile holds the sentinel, not the key; the value the deploy
+          # actually used comes from the same secret the publish step read.
+          VPN_AUTOMATION_SUBSCRIPTION_KEY: ${{ secrets.AUTOVPN_SUBSCRIPTION_KEY }}
+        run: |
+          PROFILE_QUERY="$(sed -nE 's/^[[:space:]]*secret_query[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' \
+            cloudflare/container/profile.cloudflare.toml | head -1)"
+          if [ "$PROFILE_QUERY" = '{{SUBSCRIPTION_KEY}}' ] || [ -z "$PROFILE_QUERY" ]; then
+            SECRET_QUERY="$VPN_AUTOMATION_SUBSCRIPTION_KEY"
+          else
+            SECRET_QUERY="$PROFILE_QUERY"
+          fi
+          if [ -z "$SECRET_QUERY" ] || [ "$SECRET_QUERY" = '{{SUBSCRIPTION_KEY}}' ]; then
+            echo "no subscription key: set the AUTOVPN_SUBSCRIPTION_KEY secret" >&2
+            exit 1
+          fi
+          if [ -z "$DEPLOY_URL" ]; then echo "the deploy reported no pages_project_url" >&2; exit 1; fi
+          node cloudflare/scripts/verify-published.mjs "${DEPLOY_URL}/?${SECRET_QUERY}" "$ARTIFACT"
+
+      # A public repository's artifacts are downloadable without authentication,
+      # and the log carries one event per probed link with the full payload.
+      # Each link becomes a stable short fingerprint instead of being dropped.
+      - name: Strip node links from the log
+        if: always()
+        run: |
+          node cloudflare/scripts/redact-run-log.mjs \
+            "$RUNNER_TEMP/run.jsonl" "$RUNNER_TEMP/run.redacted.jsonl"
+          if [ -f "$RUNNER_TEMP/deploy.jsonl" ]; then
+            node cloudflare/scripts/redact-run-log.mjs \
+              "$RUNNER_TEMP/deploy.jsonl" "$RUNNER_TEMP/deploy.redacted.jsonl"
+          fi
+          for f in "$RUNNER_TEMP"/run.redacted.jsonl "$RUNNER_TEMP"/deploy.redacted.jsonl; do
+            [ -f "$f" ] || continue
+            if grep -qE '(vmess|vless|trojan|ss|hysteria2?)://[A-Za-z0-9_-]' "$f"; then
+              echo "a node link survived redaction in $f; refusing to upload it" >&2
+              exit 1
+            fi
+          done
+
+      - name: Upload the run log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloudflare-subscription-run
+          path: |
+            ${{ runner.temp }}/run.redacted.jsonl
+            ${{ runner.temp }}/deploy.redacted.jsonl
+          if-no-files-found: warn
+          retention-days: 14
