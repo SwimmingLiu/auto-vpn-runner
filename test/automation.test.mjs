@@ -12,9 +12,11 @@ test('a release opens a pin PR instead of moving the pin in place', () => {
   assert.match(bump, /repository_dispatch:/);
   assert.match(bump, /types: \[autovpn-release\]/);
   assert.match(bump, /workflow_dispatch:/);
-  assert.match(bump, /contents: write/);
+  assert.match(bump, /contents: read/);
+  assert.doesNotMatch(bump, /contents: write/, 'the GITHUB_TOKEN does not push the workflow change');
   assert.doesNotMatch(bump, /pull-requests: write/, 'the GITHUB_TOKEN does not create the PR');
   assert.match(bump, /ref: main/);
+  assert.match(bump, /token: \$\{\{ secrets\.AUTOVPN_RUNNER_TOKEN \}\}/, 'the checkout must push with the PAT');
   assert.match(bump, /gh pr create/);
   assert.match(bump, /git push --force origin "\$\{BRANCH\}"/);
   assert.doesNotMatch(bump, /git push(?: --force)? origin main/);
@@ -30,7 +32,10 @@ test('the pin workflow validates the tag and refuses a downgrade', () => {
   assert.match(bump, /compare\/main\.\.\.\$\{RELEASE_SHA\}/, 'the release commit is not required to be on main');
   assert.match(bump, /behind\|identical/, 'a commit outside main is not rejected');
   assert.match(bump, /compare\/\$\{CURRENT\}\.\.\.\$\{RELEASE_SHA\}/);
-  assert.match(bump, /!= "ahead"/);
+  assert.match(bump, /Could not compare \$\{RELEASE_SHA\} with the current pin/);
+  assert.doesNotMatch(bump, /STATUS=unknown/, 'an API failure must not look like a downgrade');
+  assert.match(bump, /ahead\)/);
+  assert.match(bump, /behind\|identical/);
   assert.match(bump, /Already pinned/);
 });
 

@@ -46,8 +46,9 @@ Review and merge the PR, then run the scheduled workflow once by hand before
 letting the schedule take over.
 
 The dispatch and the pin PR need `AUTOVPN_RUNNER_TOKEN`, a fine-grained token
-scoped to this repository with `Contents: read/write` and `Pull requests:
-read/write`. Set the same token in both repositories: `auto-vpn` uses it for the
-dispatch, this repository uses it to open the PR. Scheduled-workflow runs use
-the checkout's `GITHUB_TOKEN` to push the branch, then this token to open the PR
-so pull-request CI runs.
+scoped to this repository with `Contents: read/write`, `Pull requests:
+read/write` and `Workflows: read/write`. The last one is required because the
+pin lives in a workflow file, and the job's own `GITHUB_TOKEN` cannot push a
+workflow change. Set the same token in both repositories: `auto-vpn` uses it
+for the dispatch, this repository uses it to push the branch and open the PR.
+The PAT push and a PAT-created PR also mean pull-request CI runs.

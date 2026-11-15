@@ -17,8 +17,10 @@ on:
         description: Commit the tag points at
         required: true
 
+# The push writes a workflow file, which the job's GITHUB_TOKEN cannot do; the
+# checkout and push use the fine-grained token instead.
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: bump-pipeline-ref
@@ -35,11 +37,22 @@ jobs:
     timeout-minutes: 10
 
     steps:
+      - name: Check the pin token
+        env:
+          PIN_TOKEN: ${{ secrets.AUTOVPN_RUNNER_TOKEN }}
+        run: |
+          if [ -z "${PIN_TOKEN:-}" ]; then
+            echo "::error::AUTOVPN_RUNNER_TOKEN is not set, so the pin PR cannot be pushed or opened."
+            echo "Set a fine-grained token for this repository with Contents: read/write, Pull requests: read/write and Workflows: read/write."
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 0
+          token: ${{ secrets.AUTOVPN_RUNNER_TOKEN }}
 
       - name: Resolve inputs
         id: input
@@ -119,15 +132,25 @@ jobs:
             echo "needed=false" >> "${GITHUB_OUTPUT}"
             exit 0
           fi
-          # Never move the pin backwards when an old tag is rebuilt.
-          STATUS="$(api "repos/${SOURCE_REPO}/compare/${CURRENT}...${RELEASE_SHA}" '.status')" || STATUS=unknown
-          echo "compare=${STATUS:-unknown}"
-          if [ "${STATUS:-unknown}" != "ahead" ]; then
-            echo "::warning::${RELEASE_SHA} is not ahead of the current pin ${CURRENT} (status=${STATUS:-unknown}); not opening a PR."
-            echo "needed=false" >> "${GITHUB_OUTPUT}"
-            exit 0
-          fi
-          echo "needed=true" >> "${GITHUB_OUTPUT}"
+          # Never move the pin backwards when an old tag is rebuilt, and never
+          # treat an API failure as "nothing to do": that would drop a release.
+          STATUS="$(api "repos/${SOURCE_REPO}/compare/${CURRENT}...${RELEASE_SHA}" '.status')" || {
+            echo "::error::Could not compare ${RELEASE_SHA} with the current pin ${CURRENT}."
+            exit 1
+          }
+          case "${STATUS}" in
+            ahead)
+              echo "needed=true" >> "${GITHUB_OUTPUT}"
+              ;;
+            behind|identical)
+              echo "::warning::${RELEASE_SHA} is not ahead of the current pin ${CURRENT} (status=${STATUS}); not opening a PR."
+              echo "needed=false" >> "${GITHUB_OUTPUT}"
+              ;;
+            *)
+              echo "::error::Unexpected comparison of ${RELEASE_SHA} with the current pin ${CURRENT} (status=${STATUS})."
+              exit 1
+              ;;
+          esac
 
       - name: Update the pin
         if: steps.pin.outputs.needed == 'true'
@@ -171,7 +194,7 @@ jobs:
         run: |
           if [ -z "${GH_TOKEN:-}" ]; then
             echo "::error::AUTOVPN_RUNNER_TOKEN is not set, so the pin PR cannot be opened."
-            echo "Set a fine-grained token for this repository with Contents: read/write and Pull requests: read/write."
+            echo "Set a fine-grained token for this repository with Contents: read/write, Pull requests: read/write and Workflows: read/write."
             exit 1
           fi
           BODY="$(printf '%s\n' \
