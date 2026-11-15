@@ -16,15 +16,13 @@ Secrets — Settings → Secrets and variables → Actions → Secrets:
 | `AUTOVPN_SUBSCRIPTION_URL` | The published subscription the crawl egresses through and that the run keeps in service |
 | `AUTOVPN_SUBSCRIPTION_KEY` | The key the published subscription answers to; the profile defers to it and never stores it |
 | `AUTOVPN_PAGES_ADMIN` | The share worker's admin token, read at publish |
-| `ACCOUNTS_PART_1`, `ACCOUNTS_PART_2` | The account pool, split because a single 57 KB secret cannot be rotated or inspected |
+| `AUTOVPN_ACCOUNTS_DB_URL` | The shared Postgres pool (`autovpn.accounts`); the run syncs it instead of importing a split secret |
 
 Variables — same screen, Variables tab:
 
 | Variable | What it is |
 |---|---|
 | `CLOUDFLARE_ACCOUNT_ID` | The account the Pages project belongs to |
-| `ACCOUNTS_PARTS` | Number of pool parts (`2`) |
-| `ACCOUNTS_POOL_BYTES`, `ACCOUNTS_POOL_SHA256` | Size and digest the assembler checks the joined parts against |
 
 Secret values cannot be read back from another repository; they have to be added here from wherever they are kept. Add them at repository level — the workflow deliberately declares no `environment`, so an environment-scoped secret would be invisible to it.
 
