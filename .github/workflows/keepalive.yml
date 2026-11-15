@@ -1,0 +1,52 @@
+name: Keepalive
+
+# GitHub disables scheduled workflows in a public repository after 60 days
+# without repository activity. A scheduled workflow's own runs do not reset
+# that clock, so this twice-monthly heartbeat commit is the activity that keeps
+# the nightly publish eligible. It touches one file and nothing else.
+
+on:
+  schedule:
+    - cron: '17 4 1,15 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+jobs:
+  heartbeat:
+    name: Commit the heartbeat
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Update the heartbeat
+        run: |
+          TODAY="$(date -u +%F)"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          printf '%s\n' "${TODAY}" > .github/keepalive
+          git add .github/keepalive
+          if git diff --cached --quiet; then
+            echo "Heartbeat already current."
+            exit 0
+          fi
+          git commit -m "chore: keepalive ${TODAY} [skip ci]"
+          for attempt in 1 2 3; do
+            if git push; then
+              exit 0
+            fi
+            git pull --rebase origin main
+            sleep $(( attempt * 5 ))
+          done
+          echo "::error::Could not push the keepalive commit."
+          exit 1

@@ -1,0 +1,223 @@
+name: Bump pipeline pin
+
+# A release in `auto-vpn` dispatches this. The pin is a commit, so a release
+# cannot reach production until this PR is merged and the nightly workflow is
+# run once by hand. That is deliberate: a bad release must not publish a
+# subscription overnight. The workflow never pushes to main and never merges.
+
+on:
+  repository_dispatch:
+    types: [autovpn-release]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, for example v2.4.0
+        required: true
+      sha:
+        description: Commit the tag points at
+        required: true
+
+# The push writes a workflow file, which the job's GITHUB_TOKEN cannot do; the
+# checkout and push use the fine-grained token instead.
+permissions:
+  contents: read
+
+concurrency:
+  group: bump-pipeline-ref
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: swimmingliu/auto-vpn
+  WORKFLOW_PATH: .github/workflows/scheduled-subscription.yml
+
+jobs:
+  bump:
+    name: Open pin bump PR
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Check the pin token
+        env:
+          PIN_TOKEN: ${{ secrets.AUTOVPN_RUNNER_TOKEN }}
+        run: |
+          if [ -z "${PIN_TOKEN:-}" ]; then
+            echo "::error::AUTOVPN_RUNNER_TOKEN is not set, so the pin PR cannot be pushed or opened."
+            echo "Set a fine-grained token for this repository with Contents: read/write, Pull requests: read/write and Workflows: read/write."
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.AUTOVPN_RUNNER_TOKEN }}
+
+      - name: Resolve inputs
+        id: input
+        env:
+          EVENT_TAG: ${{ github.event.client_payload.tag }}
+          EVENT_SHA: ${{ github.event.client_payload.sha }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_SHA: ${{ inputs.sha }}
+        run: |
+          TAG="${EVENT_TAG:-$INPUT_TAG}"
+          SHA="${EVENT_SHA:-$INPUT_SHA}"
+          if ! printf '%s' "${TAG}" | grep -Eq '^v[0-9]+\.[0-9]+(\.[0-9]+)?$'; then
+            echo "::error::Invalid release tag: ${TAG}"
+            exit 1
+          fi
+          if ! printf '%s' "${SHA}" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::Invalid release commit: ${SHA}"
+            exit 1
+          fi
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "sha=${SHA}" >> "${GITHUB_OUTPUT}"
+
+      - name: Check the current pin
+        id: pin
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.input.outputs.tag }}
+          RELEASE_SHA: ${{ steps.input.outputs.sha }}
+        run: |
+          # Public-repo reads use the runner token, not the PR token, and are
+          # retried: a transient API failure must not silently skip a release.
+          api() {
+            local path="$1"
+            local query="$2"
+            local attempt
+            for attempt in 1 2 3; do
+              if gh api "${path}" --jq "${query}" 2>/dev/null; then
+                return 0
+              fi
+              sleep $(( attempt * 5 ))
+            done
+            return 1
+          }
+
+          CURRENT="$(sed -nE 's/^[[:space:]]*PIPELINE_REF:[[:space:]]*"([0-9a-f]{40})".*/\1/p' "${WORKFLOW_PATH}" | head -1)"
+          if [ -z "${CURRENT}" ]; then
+            echo "::error::No PIPELINE_REF in ${WORKFLOW_PATH}"
+            exit 1
+          fi
+          echo "current=${CURRENT}" >> "${GITHUB_OUTPUT}"
+
+          # The dispatch is only trusted if the tag names this commit and the
+          # commit is already on the source repository's main. A dispatch with
+          # an arbitrary SHA cannot pin feature-branch code into production.
+          TAG_SHA="$(api "repos/${SOURCE_REPO}/commits/${RELEASE_TAG}" '.sha')" || {
+            echo "::error::Could not resolve ${RELEASE_TAG} in ${SOURCE_REPO}."
+            exit 1
+          }
+          if [ "${TAG_SHA}" != "${RELEASE_SHA}" ]; then
+            echo "::error::${RELEASE_TAG} points at ${TAG_SHA}, not ${RELEASE_SHA}."
+            exit 1
+          fi
+          MAIN_STATUS="$(api "repos/${SOURCE_REPO}/compare/main...${RELEASE_SHA}" '.status')" || {
+            echo "::error::Could not compare ${RELEASE_SHA} with ${SOURCE_REPO} main."
+            exit 1
+          }
+          case "${MAIN_STATUS}" in
+            behind|identical) ;;
+            *)
+              echo "::error::${RELEASE_SHA} is not on ${SOURCE_REPO} main (status=${MAIN_STATUS})."
+              exit 1
+              ;;
+          esac
+
+          if [ "${CURRENT}" = "${RELEASE_SHA}" ]; then
+            echo "Already pinned to ${RELEASE_SHA}; nothing to do."
+            echo "needed=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          # Never move the pin backwards when an old tag is rebuilt, and never
+          # treat an API failure as "nothing to do": that would drop a release.
+          STATUS="$(api "repos/${SOURCE_REPO}/compare/${CURRENT}...${RELEASE_SHA}" '.status')" || {
+            echo "::error::Could not compare ${RELEASE_SHA} with the current pin ${CURRENT}."
+            exit 1
+          }
+          case "${STATUS}" in
+            ahead)
+              echo "needed=true" >> "${GITHUB_OUTPUT}"
+              ;;
+            behind|identical)
+              echo "::warning::${RELEASE_SHA} is not ahead of the current pin ${CURRENT} (status=${STATUS}); not opening a PR."
+              echo "needed=false" >> "${GITHUB_OUTPUT}"
+              ;;
+            *)
+              echo "::error::Unexpected comparison of ${RELEASE_SHA} with the current pin ${CURRENT} (status=${STATUS})."
+              exit 1
+              ;;
+          esac
+
+      - name: Update the pin
+        if: steps.pin.outputs.needed == 'true'
+        env:
+          RELEASE_SHA: ${{ steps.input.outputs.sha }}
+        run: |
+          node - "${WORKFLOW_PATH}" "${RELEASE_SHA}" <<'NODE'
+          const fs = require('node:fs');
+          const [file, sha] = process.argv.slice(2);
+          const text = fs.readFileSync(file, 'utf8');
+          const next = text.replace(/^(\s*PIPELINE_REF:\s*")[0-9a-f]{40}(")/m, `$1${sha}$2`);
+          if (next === text) {
+            console.error(`No PIPELINE_REF line to update in ${file}`);
+            process.exit(1);
+          }
+          fs.writeFileSync(file, next);
+          NODE
+          git diff -- "${WORKFLOW_PATH}"
+
+      - name: Commit and push the branch
+        if: steps.pin.outputs.needed == 'true'
+        env:
+          TAG: ${{ steps.input.outputs.tag }}
+        run: |
+          BRANCH="chore/pipeline-ref-${TAG}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "${BRANCH}"
+          git add "${WORKFLOW_PATH}"
+          git commit -m "chore: pin the pipeline to ${TAG}"
+          git push --force origin "${BRANCH}"
+          echo "BRANCH=${BRANCH}" >> "${GITHUB_ENV}"
+
+      - name: Open the pull request
+        if: steps.pin.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.AUTOVPN_RUNNER_TOKEN }}
+          TAG: ${{ steps.input.outputs.tag }}
+          RELEASE_SHA: ${{ steps.input.outputs.sha }}
+          CURRENT_SHA: ${{ steps.pin.outputs.current }}
+        run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::AUTOVPN_RUNNER_TOKEN is not set, so the pin PR cannot be opened."
+            echo "Set a fine-grained token for this repository with Contents: read/write, Pull requests: read/write and Workflows: read/write."
+            exit 1
+          fi
+          BODY="$(printf '%s\n' \
+            "Automated pin bump from the ${TAG} release in ${SOURCE_REPO}." \
+            "" \
+            "- Release: https://github.com/${SOURCE_REPO}/releases/tag/${TAG}" \
+            "- Release commit: ${RELEASE_SHA}" \
+            "- Previous pin: ${CURRENT_SHA}" \
+            "" \
+            "Merge this, then run Scheduled Subscription Publish once by hand before the nightly schedule takes over." \
+            "" \
+            "Opened by the release workflow; this PR is never merged automatically.")"
+          OPEN="$(gh pr list --repo "${GITHUB_REPOSITORY}" --head "${BRANCH}" --state open --json number --jq '.[0].number // empty')" || {
+            echo "::error::Could not list pull requests for ${BRANCH}."
+            exit 1
+          }
+          if [ -n "${OPEN}" ]; then
+            gh pr edit "${OPEN}" --repo "${GITHUB_REPOSITORY}" \
+              --title "chore: pin the pipeline to ${TAG}" \
+              --body "${BODY}"
+            echo "Updated existing PR #${OPEN}; the force-push moved its branch."
+            exit 0
+          fi
+          gh pr create --repo "${GITHUB_REPOSITORY}" --base main --head "${BRANCH}" \
+            --title "chore: pin the pipeline to ${TAG}" \
+            --body "${BODY}"
