@@ -23,7 +23,7 @@ test('a release opens a pin PR instead of moving the pin in place', () => {
 });
 
 test('the pin workflow validates the tag and refuses a downgrade', () => {
-  assert.ok(bump.includes("'^v[0-9]+\\.[0-9]+\\.[0-9]+$'"), 'release tags are not validated');
+  assert.ok(bump.includes("'^v[0-9]+\\.[0-9]+(\\.[0-9]+)?$'"), 'release tags are not validated');
   assert.ok(bump.includes("'^[0-9a-f]{40}$'"), 'release commits are not validated');
   assert.match(bump, /compare\/\$\{CURRENT\}\.\.\.\$\{RELEASE_SHA\}/);
   assert.match(bump, /!= "ahead"/);
