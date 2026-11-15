@@ -1,17 +1,18 @@
-name: Cloudflare Subscription
+name: Scheduled Subscription Publish
 
-# The scheduled half of the AutoVPN Cloudflare deployment.
+# The nightly publish, run by GitHub Actions.
 #
-# The pipeline code lives in `swimmingliu/auto-vpn`; this repository owns the
-# schedule, the credentials and the run history. The checkout below is pinned to
-# one commit of that repository so a night cannot be changed by an in-flight
-# branch, and moving the pin is a reviewed change here.
+# Each night this workflow checks out the pipeline at the pin below, builds its
+# CLI, syncs the account pool from its database, measures through the nodes in
+# the currently published subscription, and uploads the measured artifact to
+# Cloudflare Pages. This repository owns only the schedule, the credentials and
+# the run history; the pipeline code lives in `swimmingliu/auto-vpn`, pinned so
+# a night cannot be changed by an in-flight branch.
 #
-# The crawl runs on this runner, not in a Cloudflare Container: Containers need
-# the Workers Paid plan, while everything else works on the free plan and a
-# runner is a Linux box with Docker, Node and a public IP. Egress is unchanged:
-# the crawl goes out through the nodes in the already-published subscription,
-# never through the runner's own address.
+# The crawl runs on the runner, not in a Cloudflare Container: Containers need
+# the Workers Paid plan, while everything else works on the free plan. Egress is
+# unchanged: the crawl goes out through the nodes in the already-published
+# subscription, never through the runner's own address.
 
 on:
   workflow_dispatch:
