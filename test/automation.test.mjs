@@ -13,7 +13,8 @@ test('a release opens a pin PR instead of moving the pin in place', () => {
   assert.match(bump, /types: \[autovpn-release\]/);
   assert.match(bump, /workflow_dispatch:/);
   assert.match(bump, /contents: write/);
-  assert.match(bump, /pull-requests: write/);
+  assert.doesNotMatch(bump, /pull-requests: write/, 'the GITHUB_TOKEN does not create the PR');
+  assert.match(bump, /ref: main/);
   assert.match(bump, /gh pr create/);
   assert.match(bump, /git push --force origin "\$\{BRANCH\}"/);
   assert.doesNotMatch(bump, /git push(?: --force)? origin main/);
@@ -25,6 +26,9 @@ test('a release opens a pin PR instead of moving the pin in place', () => {
 test('the pin workflow validates the tag and refuses a downgrade', () => {
   assert.ok(bump.includes("'^v[0-9]+\\.[0-9]+(\\.[0-9]+)?$'"), 'release tags are not validated');
   assert.ok(bump.includes("'^[0-9a-f]{40}$'"), 'release commits are not validated');
+  assert.match(bump, /commits\/\$\{RELEASE_TAG\}/, 'the tag is not resolved to its commit');
+  assert.match(bump, /compare\/main\.\.\.\$\{RELEASE_SHA\}/, 'the release commit is not required to be on main');
+  assert.match(bump, /behind\|identical/, 'a commit outside main is not rejected');
   assert.match(bump, /compare\/\$\{CURRENT\}\.\.\.\$\{RELEASE_SHA\}/);
   assert.match(bump, /!= "ahead"/);
   assert.match(bump, /Already pinned/);
@@ -36,8 +40,10 @@ test('the keepalive commits inside every 60-day activity window', () => {
   assert.ok(cron, 'keepalive has no cron expression');
   const [minute, hour, dayOfMonth, month] = cron.trim().split(/\s+/);
   assert.equal(month, '*', 'keepalive must run every month');
-  assert.equal(dayOfMonth, '1', 'keepalive must run on the first of the month');
-  assert.ok(Number(minute) >= 0 && Number(hour) >= 0, 'keepalive cron is not a time');
+  assert.equal(dayOfMonth, '1,15', 'keepalive must run twice a month');
+  assert.ok(Number(minute) >= 0 && Number(minute) <= 59, 'keepalive minute is invalid');
+  assert.ok(Number(hour) >= 0 && Number(hour) <= 23, 'keepalive hour is invalid');
+  assert.match(keepalive, /ref: main/);
   assert.match(keepalive, /\.github\/keepalive/);
   assert.match(keepalive, /git push/);
   assert.match(keepalive, /contents: write/);

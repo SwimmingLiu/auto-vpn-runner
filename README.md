@@ -12,8 +12,10 @@ the subscription remain owned by the other repository and its database.
 ## Configuration
 
 Credentials are repository secrets, configured under Settings → Secrets and
-variables → Actions. They are deliberately not described here; the workflow
-names the ones it reads.
+variables → Actions. Secret values are deliberately not described here; the
+workflows name the secrets they read. The permission shape for the
+cross-repository `AUTOVPN_RUNNER_TOKEN` is documented under
+[Moving the pin](#moving-the-pin).
 
 ## Schedule
 
@@ -23,10 +25,11 @@ service. A held night is a successful run, not a failure.
 
 GitHub disables a scheduled workflow in a public repository after 60 days
 without repository activity; a scheduled workflow's own runs do not reset that
-clock. The monthly `Keepalive` workflow commits a dated heartbeat file, which is
-ordinary repository activity and keeps the nightly schedule eligible. If the
-repository is ever frozen for more than 60 days anyway, re-enable the schedule
-from the Actions tab.
+clock. The twice-monthly `Keepalive` workflow commits a dated heartbeat file,
+which is ordinary repository activity and keeps the nightly schedule eligible.
+Two runs a month leave room for one missed run. If the repository is ever
+frozen for more than 60 days anyway, re-enable the schedule from the Actions
+tab.
 
 ## Running it by hand
 
@@ -44,6 +47,7 @@ letting the schedule take over.
 
 The dispatch and the pin PR need `AUTOVPN_RUNNER_TOKEN`, a fine-grained token
 scoped to this repository with `Contents: read/write` and `Pull requests:
-read/write`. It is set in `auto-vpn` for the dispatch and here for the PR
-(scheduled-workflow runs use the checkout's `GITHUB_TOKEN` to push the branch,
-then this token to open the PR so pull-request CI runs).
+read/write`. Set the same token in both repositories: `auto-vpn` uses it for the
+dispatch, this repository uses it to open the PR. Scheduled-workflow runs use
+the checkout's `GITHUB_TOKEN` to push the branch, then this token to open the PR
+so pull-request CI runs.

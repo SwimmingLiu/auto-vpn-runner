@@ -19,7 +19,6 @@ on:
 
 permissions:
   contents: write
-  pull-requests: write
 
 concurrency:
   group: bump-pipeline-ref
@@ -39,6 +38,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
 
       - name: Resolve inputs
@@ -65,23 +65,62 @@ jobs:
       - name: Check the current pin
         id: pin
         env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.input.outputs.tag }}
           RELEASE_SHA: ${{ steps.input.outputs.sha }}
         run: |
+          # Public-repo reads use the runner token, not the PR token, and are
+          # retried: a transient API failure must not silently skip a release.
+          api() {
+            local path="$1"
+            local query="$2"
+            local attempt
+            for attempt in 1 2 3; do
+              if gh api "${path}" --jq "${query}" 2>/dev/null; then
+                return 0
+              fi
+              sleep $(( attempt * 5 ))
+            done
+            return 1
+          }
+
           CURRENT="$(sed -nE 's/^[[:space:]]*PIPELINE_REF:[[:space:]]*"([0-9a-f]{40})".*/\1/p' "${WORKFLOW_PATH}" | head -1)"
           if [ -z "${CURRENT}" ]; then
             echo "::error::No PIPELINE_REF in ${WORKFLOW_PATH}"
             exit 1
           fi
           echo "current=${CURRENT}" >> "${GITHUB_OUTPUT}"
+
+          # The dispatch is only trusted if the tag names this commit and the
+          # commit is already on the source repository's main. A dispatch with
+          # an arbitrary SHA cannot pin feature-branch code into production.
+          TAG_SHA="$(api "repos/${SOURCE_REPO}/commits/${RELEASE_TAG}" '.sha')" || {
+            echo "::error::Could not resolve ${RELEASE_TAG} in ${SOURCE_REPO}."
+            exit 1
+          }
+          if [ "${TAG_SHA}" != "${RELEASE_SHA}" ]; then
+            echo "::error::${RELEASE_TAG} points at ${TAG_SHA}, not ${RELEASE_SHA}."
+            exit 1
+          fi
+          MAIN_STATUS="$(api "repos/${SOURCE_REPO}/compare/main...${RELEASE_SHA}" '.status')" || {
+            echo "::error::Could not compare ${RELEASE_SHA} with ${SOURCE_REPO} main."
+            exit 1
+          }
+          case "${MAIN_STATUS}" in
+            behind|identical) ;;
+            *)
+              echo "::error::${RELEASE_SHA} is not on ${SOURCE_REPO} main (status=${MAIN_STATUS})."
+              exit 1
+              ;;
+          esac
+
           if [ "${CURRENT}" = "${RELEASE_SHA}" ]; then
             echo "Already pinned to ${RELEASE_SHA}; nothing to do."
             echo "needed=false" >> "${GITHUB_OUTPUT}"
             exit 0
           fi
           # Never move the pin backwards when an old tag is rebuilt.
-          STATUS="$(curl -fsS -H 'Accept: application/vnd.github+json' \
-            "https://api.github.com/repos/${SOURCE_REPO}/compare/${CURRENT}...${RELEASE_SHA}" \
-            | jq -r '.status // "unknown"' 2>/dev/null || true)"
+          STATUS="$(api "repos/${SOURCE_REPO}/compare/${CURRENT}...${RELEASE_SHA}" '.status')" || STATUS=unknown
           echo "compare=${STATUS:-unknown}"
           if [ "${STATUS:-unknown}" != "ahead" ]; then
             echo "::warning::${RELEASE_SHA} is not ahead of the current pin ${CURRENT} (status=${STATUS:-unknown}); not opening a PR."
@@ -135,14 +174,6 @@ jobs:
             echo "Set a fine-grained token for this repository with Contents: read/write and Pull requests: read/write."
             exit 1
           fi
-          OPEN="$(gh pr list --repo "${GITHUB_REPOSITORY}" --head "${BRANCH}" --state open --json number --jq 'length')" || {
-            echo "::error::Could not list pull requests for ${BRANCH}."
-            exit 1
-          }
-          if [ "${OPEN}" != "0" ]; then
-            echo "An open PR already exists for ${BRANCH}; the force-push updated it."
-            exit 0
-          fi
           BODY="$(printf '%s\n' \
             "Automated pin bump from the ${TAG} release in ${SOURCE_REPO}." \
             "" \
@@ -153,6 +184,17 @@ jobs:
             "Merge this, then run Scheduled Subscription Publish once by hand before the nightly schedule takes over." \
             "" \
             "Opened by the release workflow; this PR is never merged automatically.")"
+          OPEN="$(gh pr list --repo "${GITHUB_REPOSITORY}" --head "${BRANCH}" --state open --json number --jq '.[0].number // empty')" || {
+            echo "::error::Could not list pull requests for ${BRANCH}."
+            exit 1
+          }
+          if [ -n "${OPEN}" ]; then
+            gh pr edit "${OPEN}" --repo "${GITHUB_REPOSITORY}" \
+              --title "chore: pin the pipeline to ${TAG}" \
+              --body "${BODY}"
+            echo "Updated existing PR #${OPEN}; the force-push moved its branch."
+            exit 0
+          fi
           gh pr create --repo "${GITHUB_REPOSITORY}" --base main --head "${BRANCH}" \
             --title "chore: pin the pipeline to ${TAG}" \
             --body "${BODY}"
