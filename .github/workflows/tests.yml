@@ -1,0 +1,32 @@
+name: Workflow tests
+
+# Guards the nightly workflow itself: every pool-touching step must resolve the
+# same runtime root and database, the log must be redacted before upload, and
+# the CLI must be built from the pinned checkout. These are millisecond tests;
+# they do not touch the network or Cloudflare.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Workflow tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Run workflow tests
+        run: node --test test/*.test.mjs
