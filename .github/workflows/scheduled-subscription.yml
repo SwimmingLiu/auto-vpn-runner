@@ -42,7 +42,7 @@ env:
   MIHOMO_VERSION: "v1.19.34"
   # The auto-vpn commit whose CLI is measured. Move this deliberately; the
   # workflow and the CLI must come from the same commit.
-  PIPELINE_REF: "2d7f3d4f1ef37a661b1ad251ffb0545110d9e669"
+  PIPELINE_REF: "a26d6ac1ddd54c04426594940689a1cd265adb72"
 
 jobs:
   publish:
