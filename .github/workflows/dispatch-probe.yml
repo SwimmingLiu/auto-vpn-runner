@@ -3,7 +3,7 @@ name: Dispatch probe
 # actually checks for GITHUB_TOKEN. The event_type matches no workflow, so a
 # successful call starts nothing. Deleted once it has answered.
 on:
-  workflow_dispatch:
+  pull_request:
 
 jobs:
   with-contents-write:
