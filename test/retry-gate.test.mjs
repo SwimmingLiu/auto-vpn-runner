@@ -301,3 +301,22 @@ test('the workflow declares the same job timeout the gate budgets for', async ()
   const declared = Number(/^\s{4}timeout-minutes:\s*(\d+)\s*$/m.exec(workflow)?.[1] ?? 0);
   assert.equal(declared, JOB_TIMEOUT_MINUTES, 'the workflow timeout and the gate budget disagree');
 });
+
+test('a chained slot whose parent published does not run', async () => {
+  // The parent is exempt from the in-flight guard (its row can still read
+  // in_progress while the child decides) but not from the publish scan: a
+  // published parent means the campaign is over. Found by running the merged
+  // gate against live history, where it answered "run" here.
+  const parent = run(1, ANCHOR + 5 * 60_000);
+  const { fetchImpl } = fakeApi([parent], { 1: PUBLISHED_STEPS });
+  const decision = await decide({
+    ...base,
+    eventName: 'repository_dispatch',
+    payload: { attempt: 2, parent_run_id: '1' },
+    nowMs: ANCHOR + 100 * 60_000,
+    fetchImpl
+  });
+  assert.equal(decision.run, false);
+  assert.equal(decision.chain, false);
+  assert.match(decision.reason, /published/);
+});

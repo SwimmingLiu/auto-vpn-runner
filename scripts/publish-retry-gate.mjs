@@ -229,12 +229,15 @@ export async function decide(options) {
     };
   }
 
-  // Every run in the window, not just the counted attempts: a manual run that
-  // publishes has done the night's work, and a later slot that crawled anyway
-  // would replace a fresh subscription with another hour of work. A manual run
-  // still does not *consume* an attempt — it is not one of the ten chances.
+  // Every run in the window, the parent included. A manual run that publishes
+  // has done the night's work, and a later slot that crawled anyway would
+  // replace a fresh subscription with another hour of work; the same holds for
+  // the run that dispatched this one. The parent is exempt from the in-flight
+  // guard above because its row may still read `in_progress` while this one
+  // decides, but it is *not* exempt from this: a parent that already published
+  // means the campaign is over, and the successor must exit rather than crawl.
+  // (A live chained slot with a published parent answered "run" before this.)
   for (const run of runs) {
-    if (String(run.id) === parentRunId) continue;
     // eslint-disable-next-line no-await-in-loop
     const outcome = await outcomeOf(fetchImpl, token, repository, run.id);
     if (outcome === 'published') {
