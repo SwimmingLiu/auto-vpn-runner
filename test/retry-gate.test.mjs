@@ -3,6 +3,9 @@ import test from 'node:test';
 
 import {
   BASE_BACKOFF_MS,
+  CRAWL_BUDGET_MINUTES,
+  JOB_OVERHEAD_MINUTES,
+  JOB_TIMEOUT_MINUTES,
   MAX_ATTEMPTS,
   MAX_WAIT_MINUTES,
   backoffAfter,
@@ -278,4 +281,23 @@ test('a manual crawl in progress holds the next slot', async () => {
   const decision = await decide({ ...base, nowMs: ANCHOR + 10 * 60_000, fetchImpl });
   assert.equal(decision.run, false);
   assert.match(decision.reason, /still in_progress/);
+});
+
+test('the wait cap leaves room for a real crawl inside the job timeout', () => {
+  // A chained slot sleeps before it crawls. If the cap plus the crawl budget
+  // ever exceeded the job's wall clock, the platform would cancel the run
+  // mid-crawl: the attempt is lost and nothing is left to dispatch the next
+  // slot, so the ladder would end on the night it was needed most.
+  assert.ok(
+    MAX_WAIT_MINUTES + CRAWL_BUDGET_MINUTES + JOB_OVERHEAD_MINUTES <= JOB_TIMEOUT_MINUTES,
+    `wait ${MAX_WAIT_MINUTES} + crawl ${CRAWL_BUDGET_MINUTES} + overhead ${JOB_OVERHEAD_MINUTES} exceeds the ${JOB_TIMEOUT_MINUTES} min job timeout`
+  );
+  assert.equal(MAX_WAIT_MINUTES, 200, 'the derived cap is 200 minutes');
+});
+
+test('the workflow declares the same job timeout the gate budgets for', async () => {
+  const { readFileSync } = await import('node:fs');
+  const workflow = readFileSync(new URL('../.github/workflows/scheduled-subscription.yml', import.meta.url), 'utf8');
+  const declared = Number(/^\s{4}timeout-minutes:\s*(\d+)\s*$/m.exec(workflow)?.[1] ?? 0);
+  assert.equal(declared, JOB_TIMEOUT_MINUTES, 'the workflow timeout and the gate budget disagree');
 });

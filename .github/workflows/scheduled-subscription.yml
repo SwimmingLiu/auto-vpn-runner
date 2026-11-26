@@ -62,9 +62,12 @@ jobs:
   publish:
     name: Measure and publish
     runs-on: ubuntu-24.04
-    # 240 minutes of crawl budget plus the longest pause a chained slot sits
-    # through (the gate caps that at 200 minutes).
-    timeout-minutes: 420
+    # 360 is the ceiling a GitHub-hosted runner enforces; asking for more is
+    # silently clamped to it. The budget inside is: at most 200 minutes of
+    # pause (the gate caps it) + 150 for the crawl, which leaves 10 minutes of
+    # setup and upload. `test/retry-gate.test.mjs` pins that the three add up,
+    # so raising the cap cannot quietly start killing runs mid-crawl.
+    timeout-minutes: 360
     # No `environment:`: this repository owns these credentials outright, so
     # they live as repository secrets and variables. An environment here would
     # hide any secret added at repository level behind a scope this job never

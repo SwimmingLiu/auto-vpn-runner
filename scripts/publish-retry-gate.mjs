@@ -41,15 +41,31 @@ export const BASE_BACKOFF_MS = 30 * 60 * 1000;
 /** Hard ceiling the operator named: ten chances in one night. */
 export const MAX_ATTEMPTS = 10;
 /**
+ * The job's own wall clock, as the workflow declares it.
+ *
+ * 360 is what a GitHub-hosted runner enforces; `timeout-minutes` above that is
+ * clamped, so this is the real budget rather than a preference.
+ */
+export const JOB_TIMEOUT_MINUTES = 360;
+/**
+ * What the crawl is allowed to take inside that budget.
+ *
+ * The last several crawls ran 60 to 80 minutes; 150 is roughly twice the
+ * observed worst case, which is the margin a slow night needs.
+ */
+export const CRAWL_BUDGET_MINUTES = 150;
+/** Checkout, setup, upload and the log redaction. */
+export const JOB_OVERHEAD_MINUTES = 10;
+/**
  * Longest pause a run will sit through.
  *
- * A GitHub-hosted job may live six hours and the crawl takes about one and a
- * quarter, so a pause beyond this cannot be honoured inside the run that is
- * asked to wait. The ladder's useful part (30 min, 1 h, 2 h) is well inside;
- * by the fourth pause the night is nearly over and running the moment the cap
+ * A pause beyond this cannot be honoured inside the run that is asked to wait:
+ * the job would be cancelled mid-crawl, which loses the attempt *and* the next
+ * slot's dispatch. The ladder's useful part (30 min, 1 h, 2 h) is well inside;
+ * by the fourth pause the night is nearly over, and running as soon as the cap
  * expires is the same decision the full pause would have reached.
  */
-export const MAX_WAIT_MINUTES = 200;
+export const MAX_WAIT_MINUTES = JOB_TIMEOUT_MINUTES - CRAWL_BUDGET_MINUTES - JOB_OVERHEAD_MINUTES;
 
 /** The campaign window containing `now`. */
 export function campaignWindow(nowMs) {
