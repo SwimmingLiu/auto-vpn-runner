@@ -172,9 +172,14 @@ test('the gate runs before anything is fetched from the network', () => {
 });
 
 test('the chain has the permission its dispatch needs', () => {
-  // `gh api repos/.../dispatches` with the job's own token needs actions:write;
-  // `contents: read` alone answers 403 and the ladder silently stops at one.
-  assert.match(raw, /^permissions:\n(?:  .*\n)*?  actions: write$/m, 'the job cannot dispatch its next slot');
+  // `POST /repos/{owner}/{repo}/dispatches` is a Contents: write endpoint.
+  // With `actions: write` it answers 403, the chain step fails, and the ladder
+  // silently stops at the first attempt. The gate's own reads still need
+  // Actions read, and naming any permission sets the rest to none.
+  const permissions = /^permissions:\n((?:  .*\n)+)/m.exec(raw)?.[1] ?? '';
+  assert.match(permissions, /^  contents: write$/m, 'the job cannot dispatch its next slot');
+  assert.match(permissions, /^  actions: read$/m, 'the gate cannot read the run history without Actions read');
+  assert.doesNotMatch(permissions, /^  actions: write$/m, 'actions: write is not what repository_dispatch checks');
 });
 
 test('a crawl that finishes without publishing dispatches the next slot', () => {
@@ -197,7 +202,35 @@ test('a cancelled run does not chain, a failed one does', () => {
 test('the chain retries its dispatch instead of ending the night on one 5xx', () => {
   const chain = steps(raw).find((step) => /dispatches/.test(step.body) && /client_payload/.test(step.body));
   assert.ok(chain, 'nothing dispatches the next slot');
-  assert.match(chain.body, /for attempt in 1 2 3/, 'one failed dispatch call ends the ladder');
+  const tries = Number(/for attempt in 1 2 3 4 5 6/.test(chain.body) ? 6 : /for attempt in 1 2 3/.test(chain.body) ? 3 : 0);
+  assert.ok(tries >= 6, 'a dispatch outage of a few minutes ends the ladder');
+});
+
+test('the chain runs from the runner checkout, not the pipeline directory', () => {
+  // The job default is `source`; a waiter never checks that out, and the gate
+  // script lives in the runner checkout. Without this the chain step cannot
+  // even start, so no attempt ever dispatches a successor. Found by audit.
+  const chain = steps(raw).find((step) => /dispatches/.test(step.body) && /client_payload/.test(step.body));
+  assert.ok(chain, 'nothing dispatches the next slot');
+  assert.match(chain.body, /working-directory: \./, 'the chain step inherits working-directory: source');
+  assert.match(chain.body, /runner\/scripts\/publish-retry-gate\.mjs/, 'the chain step cannot find the gate');
+});
+
+test('a waiter hands its slot on without crawling', () => {
+  // The eight-hour rung of the ladder does not fit in one job. The slot that
+  // cannot wait and still crawl must still chain, or the pause is truncated
+  // back to what one job holds.
+  const chain = steps(raw).find((step) => /dispatches/.test(step.body) && /client_payload/.test(step.body));
+  assert.ok(chain, 'nothing dispatches the next slot');
+  assert.match(chain.body, /--handoff/, 'a waiter has no way to hand its slot on');
+  assert.doesNotMatch(
+    chain.body,
+    /steps\.slot\.outputs\.run == 'true'/,
+    'the chain is gated on the crawl, so a waiter can never dispatch'
+  );
+  const wait = steps(raw).find((step) => /^\s*sleep /m.test(step.body) && /wait_minutes/.test(step.body));
+  assert.ok(wait, 'no step sleeps out the pause');
+  assert.match(wait.body, /steps\.slot\.outputs\.waiter/, 'a waiter does not sleep');
 });
 
 test('steps that run before the pipeline checkout do not inherit its directory', () => {
@@ -216,6 +249,85 @@ test('steps that run before the pipeline checkout do not inherit its directory',
       `"${step.name}" runs before the pipeline checkout but inherits working-directory: source`
     );
   }
+});
+
+test('a redaction failure leaves nothing for the upload to publish', () => {
+  // The upload runs on `always()` and uploads whatever is at the path. A guard
+  // that only exits non-zero still publishes the file it just refused — and a
+  // guard that removes one file at a time publishes the sibling it had not
+  // examined yet.
+  const redact = steps(raw).find((candidate) => /redact-run-log\.mjs/.test(candidate.body));
+  assert.ok(redact, 'nothing redacts the log');
+  assert.match(redact.body, /leaked=1/, 'the guard exits on the first match instead of checking every file');
+  assert.match(
+    redact.body,
+    /for f in "\$RUNNER_TEMP"\/run\.redacted\.jsonl "\$RUNNER_TEMP"\/deploy\.redacted\.jsonl; do/,
+    'the deploy log is never examined for leaks'
+  );
+  assert.match(
+    redact.body,
+    /rm -f "\$RUNNER_TEMP"\/run\.redacted\.jsonl "\$RUNNER_TEMP"\/deploy\.redacted\.jsonl/,
+    'only the file that matched is removed; the unexamined sibling is still uploaded'
+  );
+  assert.doesNotMatch(redact.body, /rm -f "\$f"/, 'removing one file at a time leaves the sibling');
+});
+
+test('a slot that died before measuring hands on the same slot', () => {
+  // A registry 5xx in the build spends no chance and earns no pause. Chaining
+  // `--next` from it charges the night an attempt it never took and starts the
+  // next pause from a failure that measured nothing.
+  const chain = steps(raw).find((step) => /dispatches/.test(step.body) && /client_payload/.test(step.body));
+  assert.ok(chain, 'nothing dispatches the next slot');
+  assert.match(chain.body, /MEASURED: \$\{\{ steps\.measure\.outcome \}\}/, 'the chain cannot tell a measured run from a dead one');
+  assert.match(chain.body, /"\$MEASURED" != "success"/, 'the chain treats a dead run as a spent attempt');
+});
+
+test('a gate that cannot read the history fails the run visibly', () => {
+  const gate = steps(raw).find((candidate) => /publish-retry-gate\.mjs/.test(candidate.body) && /--payload/.test(candidate.body));
+  assert.ok(gate, 'no step runs the retry gate');
+  assert.match(gate.body, /::error::/, 'a fail-closed slot leaves a red run with no explanation');
+  assert.match(
+    gate.body,
+    /if \[ "\$status" -ne 0 \]; then[\s\S]*?exit "\$status"/,
+    'the annotation is not on the branch that fails the step'
+  );
+  // Without the capture, `|| true` in place of `|| status=$?` leaves the step
+  // green with run=false and the night silently skips.
+  assert.match(
+    gate.body,
+    /publish-retry-gate\.mjs[\s\S]*?\|\|\s*status=\$\?/,
+    'the gate\'s exit status is discarded; a fail-closed slot reads as a green skip'
+  );
+});
+
+test('the configuration check names the secrets the crawl needs', () => {
+  // Both are read inside Measure and Publish, so a missing one surfaces after
+  // the crawl — or inside obfuscate, where the message names a sentinel rather
+  // than the secret.
+  const check = steps(raw).find((step) => /^Check required configuration$/.test(step.name));
+  assert.ok(check, 'no configuration check step');
+  for (const key of ['AUTOVPN_SUBSCRIPTION_KEY', 'AUTOVPN_PAGES_ADMIN']) {
+    assert.match(check.body, new RegExp(`check "secret ${key}"`), `${key} is not checked before the crawl`);
+  }
+});
+
+test('a dead slot carries its streak so a misconfiguration cannot storm', () => {
+  const chain = steps(raw).find((step) => /dispatches/.test(step.body) && /client_payload/.test(step.body));
+  assert.ok(chain, 'nothing dispatches the next slot');
+  assert.match(chain.body, /--stalled/, 'a slot that dies before measuring never counts how many have');
+  assert.match(chain.body, /STALLED: \$\{\{ github\.event\.client_payload\.stalled \|\| 0 \}\}/, 'the streak is not read from the payload');
+  // The refusal is a non-zero exit from the handoff; without the capture the
+  // step would go green having dispatched nothing.
+  assert.match(
+    chain.body,
+    /--handoff[\s\S]*?\|\|\s*status=\$\?/,
+    'the handoff\'s refusal is discarded; a permanent failure would end as a green skip'
+  );
+  assert.match(
+    chain.body,
+    /if \[ "\$status" -ne 0 \][\s\S]*?exit 1/,
+    'the streak refusal does not fail the run'
+  );
 });
 
 test('a skipped slot does not try to redact logs it never produced', () => {

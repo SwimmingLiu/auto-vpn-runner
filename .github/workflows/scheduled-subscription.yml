@@ -36,15 +36,23 @@ on:
   repository_dispatch:
     types: [subscription-publish-retry]
 
-# `contents: read` is all the run needs from the pipeline; the chain step posts
-# a repository_dispatch to this repository, which its own token may do with
-# `actions: write`.
+# `POST /repos/{owner}/{repo}/dispatches` is a *Contents: write* endpoint, not
+# an Actions one: with `actions: write` the chain step answers 403 and the
+# ladder silently stops at the first attempt. The gate's own reads (workflow
+# runs, run jobs) need Actions read. Naming any permission sets the rest to
+# none, so both must be listed.
 permissions:
-  contents: read
-  actions: write
+  contents: write
+  actions: read
 
 # A publish replaces the whole Pages production deployment, so two runs must
 # never overlap.
+#
+# `cancel-in-progress: false` protects a *running* crawl; it cannot protect a
+# merely *queued* one. GitHub keeps a single pending run per group and a newer
+# arrival replaces it, so a manual dispatch parked behind a long crawl can be
+# displaced by the next cron. The slot that does start re-reads the history and
+# decides for itself, so a displaced run costs a wait, not the night.
 concurrency:
   group: subscription-publish
   cancel-in-progress: false
@@ -65,8 +73,10 @@ jobs:
     # 360 is the ceiling a GitHub-hosted runner enforces; asking for more is
     # silently clamped to it. The budget inside is: at most 200 minutes of
     # pause (the gate caps it) + 150 for the crawl, which leaves 10 minutes of
-    # setup and upload. `test/retry-gate.test.mjs` pins that the three add up,
-    # so raising the cap cannot quietly start killing runs mid-crawl.
+    # setup and upload. A pause longer than that is not crawled after: the run
+    # becomes a waiter, sleeps up to 345 minutes, hands the slot on and exits.
+    # `test/retry-gate.test.mjs` pins all three budgets, so raising one cannot
+    # quietly start killing runs mid-crawl.
     timeout-minutes: 360
     # No `environment:`: this repository owns these credentials outright, so
     # they live as repository secrets and variables. An environment here would
@@ -102,19 +112,28 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           RETRY_PAYLOAD: ${{ toJSON(github.event.client_payload || fromJSON('{}')) }}
         run: |
-          # The script prints `run: <reason>` or `skip: <reason>` itself. A step
-          # cannot read its own `outputs` — `${{ steps.slot.outputs.reason }}`
-          # here would always interpolate empty and show up in the log as a
-          # bare `slot: `.
+          # The script prints `run: <reason>`, `wait: <reason>` or `skip:
+          # <reason>` itself. A step cannot read its own `outputs` —
+          # `${{ steps.slot.outputs.reason }}` here would always interpolate
+          # empty and show up in the log as a bare `slot: `.
+          #
+          # Exit 2 means the gate could not read the run history: it writes a
+          # skip to the output file, but the step still needs to fail so the
+          # run does not read as a green night that published nothing.
+          status=0
           node runner/scripts/publish-retry-gate.mjs \
             --workflow scheduled-subscription.yml \
-            --payload "$RETRY_PAYLOAD"
+            --payload "$RETRY_PAYLOAD" || status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::error::the retry gate could not read the run history; this slot will not crawl and the ladder stops here"
+            exit "$status"
+          fi
 
       # A chained slot is due at an exact time. Sleeping at the head of the run
       # keeps the ladder's pauses honest even when the crawl that dispatched it
-      # finished late.
+      # finished late. A waiter sleeps here too, then hands the slot on.
       - name: Wait for the backoff window
-        if: ${{ steps.slot.outputs.run == 'true' && steps.slot.outputs.wait_minutes != '0' }}
+        if: ${{ (steps.slot.outputs.run == 'true' || steps.slot.outputs.waiter == 'true') && steps.slot.outputs.wait_minutes != '0' }}
         working-directory: .
         run: |
           echo "sleeping ${{ steps.slot.outputs.wait_minutes }} min before attempt ${{ steps.slot.outputs.attempt }}"
@@ -135,6 +154,8 @@ jobs:
           CF_ACCOUNT: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
           SUB_URL: ${{ secrets.AUTOVPN_SUBSCRIPTION_URL }}
           POOL_DB: ${{ secrets.AUTOVPN_ACCOUNTS_DB_URL }}
+          SUB_KEY: ${{ secrets.AUTOVPN_SUBSCRIPTION_KEY }}
+          PAGES_ADMIN: ${{ secrets.AUTOVPN_PAGES_ADMIN }}
         run: |
           missing=0
           check() { if [ -z "$2" ]; then echo "missing $1" >&2; missing=1; fi; }
@@ -142,6 +163,11 @@ jobs:
           check "variable CLOUDFLARE_ACCOUNT_ID" "$CF_ACCOUNT"
           check "secret AUTOVPN_SUBSCRIPTION_URL" "$SUB_URL"
           check "secret AUTOVPN_ACCOUNTS_DB_URL" "$POOL_DB"
+          # These two fail inside the crawl when they are missing — after the
+          # seventy-five minutes, or in the obfuscate stage where the message
+          # names a sentinel rather than the secret.
+          check "secret AUTOVPN_SUBSCRIPTION_KEY" "$SUB_KEY"
+          check "secret AUTOVPN_PAGES_ADMIN" "$PAGES_ADMIN"
           exit "$missing"
 
       # Built from the pinned checkout, not installed from npm: a night depends
@@ -335,13 +361,23 @@ jobs:
             node cloudflare/scripts/redact-run-log.mjs \
               "$RUNNER_TEMP/deploy.jsonl" "$RUNNER_TEMP/deploy.redacted.jsonl"
           fi
+          leaked=0
           for f in "$RUNNER_TEMP"/run.redacted.jsonl "$RUNNER_TEMP"/deploy.redacted.jsonl; do
             [ -f "$f" ] || continue
             if grep -qE '(vmess|vless|trojan|ss|hysteria2?)://[A-Za-z0-9_-]' "$f"; then
-              echo "a node link survived redaction in $f; refusing to upload it" >&2
-              exit 1
+              echo "a node link survived redaction in $f" >&2
+              leaked=1
             fi
           done
+          if [ "$leaked" -ne 0 ]; then
+            # The upload below runs on `always()`, so *every* candidate has to
+            # go, not just the one that matched first: the sibling has not been
+            # checked yet and would be published unexamined. A failure with
+            # nothing to upload is the safe outcome.
+            rm -f "$RUNNER_TEMP"/run.redacted.jsonl "$RUNNER_TEMP"/deploy.redacted.jsonl
+            echo "::error::a node link survived redaction; the logs were deleted, not uploaded" >&2
+            exit 1
+          fi
 
       # The ladder's next slot. Dispatched at the end of an attempt so the pause
       # is measured from when the crawl finished, and only when this attempt did
@@ -352,10 +388,19 @@ jobs:
         # `!cancelled()`, not `always()`: a failed crawl is exactly what the
         # ladder exists for and must hand over to the next slot, but a run the
         # operator cancelled must not spawn its successor.
-        if: ${{ !cancelled() && steps.slot.outputs.run == 'true' && steps.slot.outputs.chain == 'true' }}
+        #
+        # Gated on `chain`, not `run`: a waiter does not crawl, but handing the
+        # pause on is how an eight-hour rung fits inside a six-hour job.
+        if: ${{ !cancelled() && steps.slot.outputs.chain == 'true' }}
+        # The job default is `source`, which a waiter never checks out.
+        working-directory: .
         env:
           GH_TOKEN: ${{ github.token }}
           ATTEMPT: ${{ steps.slot.outputs.attempt }}
+          WAITER: ${{ steps.slot.outputs.waiter }}
+          DUE_AT: ${{ steps.slot.outputs.due_at }}
+          MEASURED: ${{ steps.measure.outcome }}
+          STALLED: ${{ github.event.client_payload.stalled || 0 }}
           PUBLISHED_HERE: ${{ steps.verify.outcome == 'success' }}
         run: |
           # A run that already published has nothing left to chain; the
@@ -365,11 +410,36 @@ jobs:
             echo "this attempt published; the ladder ends here"
             exit 0
           fi
-          payload="$(node runner/scripts/publish-retry-gate.mjs --next --attempt "$ATTEMPT")"
+          if [ "$WAITER" = "true" ]; then
+            # The pause outlasted one job. The successor finishes it with the
+            # same attempt number and the same due time, so no chance is spent
+            # and no crawl starts early.
+            payload="$(node runner/scripts/publish-retry-gate.mjs --handoff --attempt "$ATTEMPT" --due-at "$DUE_AT")"
+          elif [ "$MEASURED" != "success" ] && [ "$MEASURED" != "failure" ]; then
+            # The slot died before it measured — a registry 5xx in the build, a
+            # missing secret. It spent no chance and earned no pause, so it
+            # hands on the *same* slot with no due time and the successor
+            # recomputes both from the history. `--next` here would charge the
+            # night an attempt it never took and start the next pause early.
+            #
+            # The streak is carried: spending nothing is right for a blip and
+            # a run storm for a misconfiguration, so the handoff refuses to
+            # extend it past the limit. The cutoff lives here and not in the
+            # decision: a slot that recovers and measures must still chain.
+            status=0
+            payload="$(node runner/scripts/publish-retry-gate.mjs --handoff --attempt "$ATTEMPT" --stalled "$(( STALLED + 1 ))")" || status=$?
+            if [ "$status" -ne 0 ]; then
+              echo "::error::this slot and the ones before it keep dying before measuring; the ladder stops here"
+              exit 1
+            fi
+          else
+            payload="$(node runner/scripts/publish-retry-gate.mjs --next --attempt "$ATTEMPT")"
+          fi
           echo "dispatching the next slot with $payload"
-          # Three tries: this step is the only thing that keeps the ladder
-          # alive, and one 5xx would otherwise end the night's retries silently.
-          for attempt in 1 2 3; do
+          # Six tries over three minutes: this step is the only thing that keeps
+          # the ladder alive, and a short API outage would otherwise end the
+          # night's retries silently.
+          for attempt in 1 2 3 4 5 6; do
             if printf '{"event_type":"subscription-publish-retry","client_payload":%s}' "$payload" \
               | gh api --method POST "repos/${GITHUB_REPOSITORY}/dispatches" --input -; then
               exit 0
