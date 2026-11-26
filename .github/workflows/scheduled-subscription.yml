@@ -95,6 +95,9 @@ jobs:
       # body, empty for cron and manual runs.
       - name: Decide whether this slot runs
         id: slot
+        # The job default is `source`, which the pipeline checkout below has not
+        # created yet; bash would fail to start before the gate could decide.
+        working-directory: .
         env:
           GITHUB_TOKEN: ${{ github.token }}
           RETRY_PAYLOAD: ${{ toJSON(github.event.client_payload || fromJSON('{}')) }}
@@ -109,6 +112,7 @@ jobs:
       # finished late.
       - name: Wait for the backoff window
         if: ${{ steps.slot.outputs.run == 'true' && steps.slot.outputs.wait_minutes != '0' }}
+        working-directory: .
         run: |
           echo "sleeping ${{ steps.slot.outputs.wait_minutes }} min before attempt ${{ steps.slot.outputs.attempt }}"
           sleep $(( ${{ steps.slot.outputs.wait_minutes }} * 60 ))
@@ -320,7 +324,7 @@ jobs:
       # and the log carries one event per probed link with the full payload.
       # Each link becomes a stable short fingerprint instead of being dropped.
       - name: Strip node links from the log
-        if: always()
+        if: ${{ always() && steps.slot.outputs.run == 'true' }}
         run: |
           node cloudflare/scripts/redact-run-log.mjs \
             "$RUNNER_TEMP/run.jsonl" "$RUNNER_TEMP/run.redacted.jsonl"

@@ -199,3 +199,30 @@ test('the chain retries its dispatch instead of ending the night on one 5xx', ()
   assert.ok(chain, 'nothing dispatches the next slot');
   assert.match(chain.body, /for attempt in 1 2 3/, 'one failed dispatch call ends the ladder');
 });
+
+test('steps that run before the pipeline checkout do not inherit its directory', () => {
+  // `defaults.run.working-directory: source` is right for every crawl step and
+  // fatal for the ones ahead of it: the directory is created by the pipeline
+  // checkout, so bash refuses to start and the gate never runs. A live dispatch
+  // found this the first time it fired.
+  const all = steps(raw);
+  const pipelineCheckout = all.findIndex((step) => /repository: swimmingliu\/auto-vpn/.test(step.body));
+  assert.ok(pipelineCheckout > 0, 'no pipeline checkout step');
+  for (const step of all.slice(0, pipelineCheckout)) {
+    if (!/\brun:/.test(step.body)) continue;
+    assert.match(
+      step.body,
+      /working-directory: \./,
+      `"${step.name}" runs before the pipeline checkout but inherits working-directory: source`
+    );
+  }
+});
+
+test('a skipped slot does not try to redact logs it never produced', () => {
+  // The redaction step runs on `always()` so a failed attempt still leaves a
+  // log; on a skipped slot there is no log and `source` is not checked out, so
+  // it would fail the run for nothing.
+  const step = steps(raw).find((candidate) => /redact-run-log\.mjs/.test(candidate.body));
+  assert.ok(step, 'nothing redacts the log');
+  assert.match(step.body, /steps\.slot\.outputs\.run == 'true'/, 'redaction runs even when the slot was skipped');
+});
