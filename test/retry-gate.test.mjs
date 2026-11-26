@@ -261,3 +261,21 @@ test('the next slot is due one backoff after this attempt', () => {
   assert.equal(Date.parse(payload.due_at) - ANCHOR, backoffAfter(2));
   assert.equal(payload.parent_run_id, String(process.env.GITHUB_RUN_ID ?? ''));
 });
+
+test('a manual run that publishes ends the campaign', async () => {
+  // The operator stepping in and publishing is the night's work done. Later
+  // slots must exit instead of crawling over a fresh subscription.
+  const manual = run(1, ANCHOR + 5 * 60_000, { event: 'workflow_dispatch' });
+  const { fetchImpl } = fakeApi([manual], { 1: PUBLISHED_STEPS });
+  const decision = await decide({ ...base, nowMs: ANCHOR + 3 * 60 * 60_000, fetchImpl });
+  assert.equal(decision.run, false);
+  assert.match(decision.reason, /published/);
+});
+
+test('a manual crawl in progress holds the next slot', async () => {
+  const manual = run(1, ANCHOR + 5 * 60_000, { event: 'workflow_dispatch', status: 'in_progress' });
+  const { fetchImpl } = fakeApi([manual]);
+  const decision = await decide({ ...base, nowMs: ANCHOR + 10 * 60_000, fetchImpl });
+  assert.equal(decision.run, false);
+  assert.match(decision.reason, /still in_progress/);
+});

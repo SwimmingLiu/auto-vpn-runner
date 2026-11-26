@@ -201,7 +201,7 @@ export async function decide(options) {
   // A run that is mid-crawl holds every other slot. The parent is exempt: it is
   // the run that dispatched this one, so it is finished or finishing, and its
   // row flipping to `completed` is a race this gate must not lose.
-  const inFlight = attempted.filter((run) => run.status !== 'completed' && String(run.id) !== parentRunId);
+  const inFlight = runs.filter((run) => run.status !== 'completed' && String(run.id) !== parentRunId);
   if (inFlight.length > 0) {
     return {
       run: false,
@@ -213,7 +213,11 @@ export async function decide(options) {
     };
   }
 
-  for (const run of attempted) {
+  // Every run in the window, not just the counted attempts: a manual run that
+  // publishes has done the night's work, and a later slot that crawled anyway
+  // would replace a fresh subscription with another hour of work. A manual run
+  // still does not *consume* an attempt — it is not one of the ten chances.
+  for (const run of runs) {
     if (String(run.id) === parentRunId) continue;
     // eslint-disable-next-line no-await-in-loop
     const outcome = await outcomeOf(fetchImpl, token, repository, run.id);
