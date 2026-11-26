@@ -154,6 +154,8 @@ jobs:
           CF_ACCOUNT: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
           SUB_URL: ${{ secrets.AUTOVPN_SUBSCRIPTION_URL }}
           POOL_DB: ${{ secrets.AUTOVPN_ACCOUNTS_DB_URL }}
+          SUB_KEY: ${{ secrets.AUTOVPN_SUBSCRIPTION_KEY }}
+          PAGES_ADMIN: ${{ secrets.AUTOVPN_PAGES_ADMIN }}
         run: |
           missing=0
           check() { if [ -z "$2" ]; then echo "missing $1" >&2; missing=1; fi; }
@@ -161,6 +163,11 @@ jobs:
           check "variable CLOUDFLARE_ACCOUNT_ID" "$CF_ACCOUNT"
           check "secret AUTOVPN_SUBSCRIPTION_URL" "$SUB_URL"
           check "secret AUTOVPN_ACCOUNTS_DB_URL" "$POOL_DB"
+          # These two fail inside the crawl when they are missing — after the
+          # seventy-five minutes, or in the obfuscate stage where the message
+          # names a sentinel rather than the secret.
+          check "secret AUTOVPN_SUBSCRIPTION_KEY" "$SUB_KEY"
+          check "secret AUTOVPN_PAGES_ADMIN" "$PAGES_ADMIN"
           exit "$missing"
 
       # Built from the pinned checkout, not installed from npm: a night depends
@@ -393,6 +400,7 @@ jobs:
           WAITER: ${{ steps.slot.outputs.waiter }}
           DUE_AT: ${{ steps.slot.outputs.due_at }}
           MEASURED: ${{ steps.measure.outcome }}
+          STALLED: ${{ github.event.client_payload.stalled || 0 }}
           PUBLISHED_HERE: ${{ steps.verify.outcome == 'success' }}
         run: |
           # A run that already published has nothing left to chain; the
@@ -413,7 +421,11 @@ jobs:
             # hands on the *same* slot with no due time and the successor
             # recomputes both from the history. `--next` here would charge the
             # night an attempt it never took and start the next pause early.
-            payload="$(node runner/scripts/publish-retry-gate.mjs --handoff --attempt "$ATTEMPT")"
+            #
+            # The streak is carried: spending nothing is right for a blip and
+            # a run storm for a misconfiguration, so the gate stops chaining
+            # after a few in a row.
+            payload="$(node runner/scripts/publish-retry-gate.mjs --handoff --attempt "$ATTEMPT" --stalled "$(( STALLED + 1 ))")"
           else
             payload="$(node runner/scripts/publish-retry-gate.mjs --next --attempt "$ATTEMPT")"
           fi

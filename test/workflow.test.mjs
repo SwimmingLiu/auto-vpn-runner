@@ -281,6 +281,29 @@ test('a gate that cannot read the history fails the run visibly', () => {
   const gate = steps(raw).find((candidate) => /publish-retry-gate\.mjs/.test(candidate.body) && /--payload/.test(candidate.body));
   assert.ok(gate, 'no step runs the retry gate');
   assert.match(gate.body, /::error::/, 'a fail-closed slot leaves a red run with no explanation');
+  assert.match(
+    gate.body,
+    /if \[ "\$status" -ne 0 \]; then[\s\S]*?exit "\$status"/,
+    'the annotation is not on the branch that fails the step'
+  );
+});
+
+test('the configuration check names the secrets the crawl needs', () => {
+  // Both are read inside Measure and Publish, so a missing one surfaces after
+  // the crawl — or inside obfuscate, where the message names a sentinel rather
+  // than the secret.
+  const check = steps(raw).find((step) => /^Check required configuration$/.test(step.name));
+  assert.ok(check, 'no configuration check step');
+  for (const key of ['AUTOVPN_SUBSCRIPTION_KEY', 'AUTOVPN_PAGES_ADMIN']) {
+    assert.match(check.body, new RegExp(`check "secret ${key}"`), `${key} is not checked before the crawl`);
+  }
+});
+
+test('a dead slot carries its streak so a misconfiguration cannot storm', () => {
+  const chain = steps(raw).find((step) => /dispatches/.test(step.body) && /client_payload/.test(step.body));
+  assert.ok(chain, 'nothing dispatches the next slot');
+  assert.match(chain.body, /--stalled/, 'a slot that dies before measuring never counts how many have');
+  assert.match(chain.body, /STALLED: \$\{\{ github\.event\.client_payload\.stalled \|\| 0 \}\}/, 'the streak is not read from the payload');
 });
 
 test('a skipped slot does not try to redact logs it never produced', () => {

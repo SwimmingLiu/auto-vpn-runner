@@ -2,7 +2,6 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
-  API_RETRY_DELAYS_MS,
   BASE_BACKOFF_MS,
   CRAWL_BUDGET_MINUTES,
   JOB_OVERHEAD_MINUTES,
@@ -357,6 +356,57 @@ test('a run still executing holds every later slot', async () => {
   assert.match(decision.reason, /still in_progress/);
 });
 
+test('a slot is not blocked by its own row reading in_progress', async () => {
+  // The gate reads the run history at the head of a job that has already
+  // started, so the current run is in it and in_progress. Exempting it is half
+  // of what makes the gate able to decide at all.
+  const { fetchImpl } = fakeApi([run(999, ANCHOR, { status: 'in_progress' })]);
+  const decision = await decide({ ...base, nowMs: ANCHOR + MINUTE, fetchImpl });
+  assert.equal(decision.run, true, 'a slot refused to run because it could see itself');
+});
+
+test('a straddling parent still crawling in the API keeps its pause', async () => {
+  // The parent's row flips to `completed` a second or two after its chain
+  // step. During that window it is exempt from the in-flight guard and absent
+  // from the completed-run scan, so a parent created before the anchor lost
+  // both its number and its pause: the child crawled one minute after a
+  // ninety-minute crawl.
+  const parent = run(1, ANCHOR - 90 * MINUTE, {
+    event: 'schedule',
+    status: 'in_progress',
+    updatedAt: ANCHOR + 5 * MINUTE
+  });
+  const { fetchImpl } = fakeApi([parent], { 1: HELD_STEPS });
+  const decision = await decide({
+    ...base,
+    eventName: 'repository_dispatch',
+    payload: { attempt: 3, due_at: new Date(ANCHOR + 65 * MINUTE).toISOString(), parent_run_id: '1' },
+    nowMs: ANCHOR + 5 * MINUTE,
+    fetchImpl
+  });
+  assert.equal(decision.run, true);
+  assert.equal(decision.attempt, 2, 'the parent is this campaign\'s first attempt even before its row flips');
+  assert.equal(decision.waitMinutes, 30, 'the first rung belongs to the crawl that just finished');
+});
+
+test('a straddling parent that published calls the campaign done', async () => {
+  const parent = run(1, ANCHOR - 30 * MINUTE, {
+    event: 'repository_dispatch',
+    status: 'in_progress',
+    updatedAt: ANCHOR + MINUTE
+  });
+  const { fetchImpl } = fakeApi([parent], { 1: PUBLISHED_STEPS });
+  const decision = await decide({
+    ...base,
+    eventName: 'repository_dispatch',
+    payload: { attempt: 2, parent_run_id: '1' },
+    nowMs: ANCHOR + 2 * MINUTE,
+    fetchImpl
+  });
+  assert.equal(decision.run, false);
+  assert.match(decision.reason, /published/);
+});
+
 test('a manual dispatch ignores the gate and does not chain', async () => {
   const first = run(1, ANCHOR + 5 * MINUTE);
   const { fetchImpl } = fakeApi([first], { 1: PUBLISHED_STEPS });
@@ -394,6 +444,55 @@ test('a run cancelled before it started is not an attempt', async () => {
   const { fetchImpl } = fakeApi([expected, cancelled], { 1: HELD_STEPS, 2: NO_STEPS });
   const decision = await decide({ ...base, nowMs: ANCHOR + 120 * MINUTE, fetchImpl });
   assert.equal(decision.attempt, 2);
+});
+
+test('a crawl cancelled during Measure is still an attempt', async () => {
+  // The operator's cancel, or the job ceiling on a slow night: the step ran and
+  // was cut short. Classifying it as nothing let the next slot crawl ten
+  // minutes after an eighty-minute crawl, and let a night of overruns never
+  // reach the ceiling.
+  const cancelled = run(1, ANCHOR + 5 * MINUTE, { updatedAt: ANCHOR + 85 * MINUTE });
+  const { fetchImpl } = fakeApi([cancelled], {
+    1: [
+      { name: 'Measure', conclusion: 'cancelled' },
+      { name: 'Report a held night', conclusion: 'skipped' },
+      { name: 'Publish', conclusion: 'skipped' },
+      { name: 'Verify what is actually served', conclusion: 'skipped' }
+    ]
+  });
+  const decision = await decide({ ...base, nowMs: ANCHOR + 95 * MINUTE, fetchImpl });
+  assert.equal(decision.attempt, 2);
+  assert.equal(decision.waitMinutes, 20);
+});
+
+test('a run of slots that die before measuring stops the ladder', async () => {
+  // Spending nothing is right for a transient 5xx and a run storm for a
+  // misconfiguration: each dead slot hands on with no pause, so nothing else
+  // would ever stop it.
+  const { fetchImpl } = fakeApi([]);
+  const decision = await decide({
+    ...base,
+    eventName: 'repository_dispatch',
+    payload: { attempt: 1, stalled: 2 },
+    nowMs: ANCHOR + 10 * MINUTE,
+    fetchImpl
+  });
+  assert.equal(decision.run, true, 'the slot still gets its chance');
+  assert.equal(decision.chain, false, 'a permanent pre-measure failure must not hand on forever');
+  assert.match(decision.reason, /died before measuring/);
+});
+
+test('one dead slot does not stop the ladder', async () => {
+  const { fetchImpl } = fakeApi([]);
+  const decision = await decide({
+    ...base,
+    eventName: 'repository_dispatch',
+    payload: { attempt: 1, stalled: 1 },
+    nowMs: ANCHOR + 10 * MINUTE,
+    fetchImpl
+  });
+  assert.equal(decision.run, true);
+  assert.equal(decision.chain, true);
 });
 
 test('a crawl that failed is an attempt', async () => {
@@ -521,11 +620,14 @@ test('a run outside the current campaign is not counted', async () => {
 });
 
 test('a transient API error is retried, not fatal', async () => {
-  const runs = [];
   let failures = 2;
-  const { fetchImpl: healthy } = fakeApi(runs);
+  let calls = 0;
+  const { fetchImpl: healthy } = fakeApi([]);
   const fetchImpl = async (url, init) => {
-    if (failures > 0 && url.endsWith('/runs')) {
+    calls += 1;
+    // Match the path, not the whole URL: the request carries a query string,
+    // and a fake that never fires makes this test pass with the retry removed.
+    if (failures > 0 && new URL(url).pathname.endsWith('/runs')) {
       failures -= 1;
       return { ok: false, status: 502, json: async () => ({}) };
     }
@@ -533,7 +635,35 @@ test('a transient API error is retried, not fatal', async () => {
   };
   const decision = await decide({ ...base, nowMs: ANCHOR + MINUTE, fetchImpl });
   assert.equal(decision.run, true);
-  assert.ok(API_RETRY_DELAYS_MS.length >= 3, 'one 5xx must not be the end of the ladder');
+  assert.equal(failures, 0, 'the injected failures were never consumed; the retry was not exercised');
+  assert.ok(calls > 2, 'one 5xx ended the ladder');
+});
+
+test('a rate-limited 403 is retried, a permission 403 is not', async () => {
+  // GitHub answers a secondary rate limit with 403 and `retry-after`; the same
+  // status with no such header is a permission error that will never heal.
+  const limited = (headers) => async (url) => {
+    const response = { ok: false, status: 403, json: async () => ({}), headers: { get: (name) => headers[name] ?? null } };
+    return response;
+  };
+  let calls = 0;
+  const healthy = fakeApi([]).fetchImpl;
+  const rateLimited = async (url, init) => {
+    calls += 1;
+    if (calls === 1) return limited({ 'retry-after': '1' })(url);
+    return healthy(url, init);
+  };
+  const decision = await decide({ ...base, nowMs: ANCHOR + MINUTE, fetchImpl: rateLimited });
+  assert.equal(decision.run, true, 'a rate-limited 403 ended the ladder');
+  assert.equal(calls, 2, 'the rate-limited call was not retried');
+
+  let permissionCalls = 0;
+  const permission = async (url) => {
+    permissionCalls += 1;
+    return limited({})(url);
+  };
+  await assert.rejects(() => decide({ ...base, nowMs: ANCHOR, fetchImpl: permission }), /answered 403/);
+  assert.equal(permissionCalls, 1, 'a permission 403 was retried');
 });
 
 test('a persistent API failure still fails closed', async () => {

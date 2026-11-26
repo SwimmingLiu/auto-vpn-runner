@@ -106,6 +106,16 @@ export const CAMPAIGN_LOOKBACK_MS = 12 * 60 * 60 * 1000;
 
 /** Events that count as one of the campaign's attempts. */
 export const ATTEMPT_EVENTS = Object.freeze(['schedule', 'repository_dispatch']);
+/**
+ * How many slots in a row may die before measuring and still hand on.
+ *
+ * Such a slot spends no chance, which is right for a transient 5xx — but a
+ * permanent one (a renamed secret, a broken lockfile, a dead pin) would then
+ * hand on forever at full speed: the one failure mode where "spends nothing"
+ * turns into a run storm. Three is enough to ride out a blip and few enough
+ * that a misconfiguration ends as three red runs.
+ */
+export const MAX_STALLED_PRE_MEASURE = 2;
 
 /** The campaign window containing `now`. */
 export function campaignWindow(nowMs) {
@@ -148,10 +158,12 @@ export function classifyRun(jobSteps) {
   if (conclusionOf('Report a held night') === 'success') return 'held';
   // A run that measured and then died at Publish or Verify spent the chance
   // just the same: seventy-five minutes were measured, and a Verify failure may
-  // even have replaced the deployment. Only a step set that never reached
-  // Measure failed without spending one — that one has its own path below.
+  // even have replaced the deployment. A Measure step that was *cancelled* —
+  // the operator, or the job's own ceiling on a slow night — also ran and was
+  // cut short. Only a step set that never reached Measure failed without
+  // spending one; that one has its own path in the workflow.
   const measured = conclusionOf('Measure');
-  if (measured === 'success' || measured === 'failure') return 'failed';
+  if (measured === 'success' || measured === 'failure' || measured === 'cancelled') return 'failed';
   return 'unknown';
 }
 
@@ -185,9 +197,17 @@ async function apiGet(fetchImpl, url, token, sleep) {
         return await response.json();
       }
       const error = new Error(`GET ${url} answered ${response.status}`);
-      // 403 and 404 will not heal on a second call; only rate limits and
-      // server errors are worth another try.
-      if (response.status < 500 && response.status !== 429) throw Object.assign(error, { fatal: true });
+      // A 403 is fatal unless it is a rate limit wearing the same status:
+      // GitHub's secondary limits answer 403 with `retry-after`, and the
+      // primary limit answers 403 with `x-ratelimit-remaining: 0`. Those heal
+      // in seconds; a permission 403 never does.
+      const headers = response.headers;
+      const retryAfter = headers?.get?.('retry-after');
+      const remaining = headers?.get?.('x-ratelimit-remaining');
+      const rateLimited = response.status === 403 && Boolean(retryAfter || remaining === '0');
+      if (response.status < 500 && response.status !== 429 && !rateLimited) {
+        throw Object.assign(error, { fatal: true });
+      }
       lastError = error;
     } catch (error) {
       if (error?.fatal) throw error;
@@ -324,6 +344,30 @@ export async function decide(options) {
     outcomes.push({ run, outcome });
   }
 
+  // The run that dispatched this slot can still read `in_progress` for a
+  // second or two after its chain step — the row flip is exactly the race the
+  // payload exists to survive, and it is why the parent is exempt from the
+  // in-flight guard above. Reading only completed rows then hides the parent
+  // from the history at the one moment its child needs it: a parent created
+  // before the anchor loses its attempt number to the campaign rule *and* its
+  // pause, so its child crawls one minute after a ninety-minute crawl. Its
+  // step conclusions are already final, so read them directly.
+  const parentRun = chained && String(payload?.parent_run_id ?? '')
+    ? runs.find((run) => String(run.id) === String(payload.parent_run_id))
+    : null;
+  let parentFinishedMs = null;
+  if (parentRun && parentRun.status !== 'completed') {
+    const parentOutcome = await outcomeOf(fetchImpl, token, repository, parentRun.id, sleep);
+    if (parentOutcome === 'published') {
+      return skip(`run ${parentRun.id} published; the campaign is done`);
+    }
+    if (isAttempt(parentOutcome)) {
+      // It finished when this slot was created: the chain step runs last.
+      parentFinishedMs = nowMs;
+      outcomes.push({ run: parentRun, outcome: parentOutcome, finishedMs: parentFinishedMs });
+    }
+  }
+
   const published = outcomes.find((entry) => entry.outcome === 'published');
   if (published) {
     return skip(`run ${published.run.id} published; the campaign is done`);
@@ -341,9 +385,12 @@ export async function decide(options) {
   // halfway up the ladder: its first pause is the old attempt's, and it can be
   // two crawls from the ceiling before it does any work. Only a parent created
   // inside this window can speak for this window.
-  const parentRunId = String(payload?.parent_run_id ?? '');
-  const parentRun = chained && parentRunId ? runs.find((run) => String(run.id) === parentRunId) : null;
   const payloadInCampaign = Boolean(parentRun) && Date.parse(String(parentRun.createdAt ?? '')) >= startMs;
+
+  // Consecutive slots that died before reaching Measure. A transient failure
+  // hands on without spending a chance; a permanent one must not do that
+  // forever.
+  const stalled = Math.max(0, Number(payload?.stalled ?? 0) || 0);
 
   const chainedAttempt = payloadInCampaign ? Number(payload?.attempt ?? 0) : 0;
   // The payload is a hint, the history is the record: a cron slot that crawled
@@ -355,7 +402,7 @@ export async function decide(options) {
   }
 
   const lastFinishedMs = attempts.reduce((latest, entry) => {
-    const ended = Date.parse(String(entry.run.updatedAt ?? ''));
+    const ended = entry.finishedMs ?? Date.parse(String(entry.run.updatedAt ?? ''));
     return Number.isFinite(ended) && ended > latest ? ended : latest;
   }, startMs);
   const fromHistoryMs = attempts.length > 0
@@ -385,10 +432,15 @@ export async function decide(options) {
     // nothing to chain: the next slot would only read the window, say so, and
     // exit. A dispatch that is known to be a no-op is one more row on the run
     // list for no chance at all.
-    const chain = nowMs + backoffAfter(attempt) < endMs;
+    const inWindow = nowMs + backoffAfter(attempt) < endMs;
+    const stalledOut = stalled >= MAX_STALLED_PRE_MEASURE;
+    const chain = inWindow && !stalledOut;
     const base = attempt === 1
       ? 'first attempt of the campaign'
       : `attempt ${attempt} of ${maxAttempts}` + (waitMinutes > 0 ? `, after a ${waitMinutes} min pause` : '');
+    let reason = base;
+    if (!inWindow) reason = `${base}; the next pause would land past the campaign's end, so this is the last slot`;
+    else if (stalledOut) reason = `${base}; ${stalled} slots in a row have died before measuring, so the ladder stops here`;
     return {
       run: true,
       waiter: false,
@@ -397,7 +449,7 @@ export async function decide(options) {
       attempts: attempts.length,
       waitMinutes,
       dueAt,
-      reason: chain ? base : `${base}; the next pause would land past the campaign's end, so this is the last slot`
+      reason
     };
   }
 
@@ -428,16 +480,17 @@ export function nextSlotPayload({ attempt, nowMs }) {
 }
 
 /** The payload a waiter hands on: same slot, same due time, new parent. */
-export function handoffPayload({ attempt, dueAt }) {
+export function handoffPayload({ attempt, dueAt, stalled = 0 }) {
   return {
     attempt,
     due_at: String(dueAt ?? ''),
+    stalled: Number(stalled) || 0,
     parent_run_id: String(process.env.GITHUB_RUN_ID ?? '')
   };
 }
 
 function parseArgs(argv) {
-  const args = { json: false, payload: {}, next: false, handoff: false, attempt: 0, dueAt: null };
+  const args = { json: false, payload: {}, next: false, handoff: false, attempt: 0, dueAt: null, stalled: 0 };
   for (let index = 2; index < argv.length; index += 1) {
     const token = argv[index];
     if (token === '--json') args.json = true;
@@ -447,6 +500,7 @@ function parseArgs(argv) {
     else if (token === '--max-attempts') args.maxAttempts = Number(argv[++index]);
     else if (token === '--attempt') args.attempt = Number(argv[++index]);
     else if (token === '--due-at') args.dueAt = argv[++index];
+    else if (token === '--stalled') args.stalled = Number(argv[++index]);
     else if (token === '--payload') args.payload = JSON.parse(argv[++index] ?? '{}');
   }
   return args;
@@ -462,8 +516,9 @@ async function main() {
     return;
   }
   if (args.handoff) {
-    // A waiter hands on the slot it was given, untouched.
-    process.stdout.write(`${JSON.stringify(handoffPayload({ attempt: args.attempt, dueAt: args.dueAt }))}\n`);
+    // A waiter hands on the slot it was given, untouched. A slot that died
+    // before measuring also carries how many in a row have.
+    process.stdout.write(`${JSON.stringify(handoffPayload({ attempt: args.attempt, dueAt: args.dueAt, stalled: args.stalled }))}\n`);
     return;
   }
   const decision = await decide({
