@@ -183,3 +183,19 @@ test('a crawl that finishes without publishing dispatches the next slot', () => 
   assert.match(chain.body, /--next/, 'the chain step does not derive the next attempt number');
   assert.match(chain.body, /steps\.verify\.outcome/, 'the chain cannot tell a published attempt from a held one');
 });
+
+test('a cancelled run does not chain, a failed one does', () => {
+  // The ladder exists for thin sweeps and failed crawls, so the chain step must
+  // run on failure. A cancelled run is the operator stopping the night, and it
+  // must not spawn a successor that nobody can see.
+  const chain = steps(raw).find((step) => /dispatches/.test(step.body) && /client_payload/.test(step.body));
+  assert.ok(chain, 'nothing dispatches the next slot');
+  assert.match(chain.body, /!cancelled\(\)/, 'the chain step must run after a failure but not after a cancel');
+  assert.doesNotMatch(chain.body, /^\s+if: \$\{\{ always\(\)/m, 'always() would also chain a cancelled run');
+});
+
+test('the chain retries its dispatch instead of ending the night on one 5xx', () => {
+  const chain = steps(raw).find((step) => /dispatches/.test(step.body) && /client_payload/.test(step.body));
+  assert.ok(chain, 'nothing dispatches the next slot');
+  assert.match(chain.body, /for attempt in 1 2 3/, 'one failed dispatch call ends the ladder');
+});
