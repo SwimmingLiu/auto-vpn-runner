@@ -134,3 +134,52 @@ test('every step that can reach the obfuscate stage has the subscription key', (
     );
   }
 });
+
+/**
+ * The retry ladder is only as good as the workflow that runs it: a gate whose
+ * verdict nothing reads (or a chain step that needs a token it does not have)
+ * fails silently, and the night would go back to one attempt with nobody the
+ * wiser. These tests pin the wiring, not the decision logic — that lives in
+ * `retry-gate.test.mjs`.
+ */
+
+test('every crawl step is gated on the slot decision', () => {
+  const gated = steps(raw).filter((step) => /steps\.slot\.outputs\.run/.test(step.body));
+  const crawls = steps(raw).filter((step) => /\bautovpn run\b|retry-stage|egress-on-runner/.test(step.body));
+  assert.ok(crawls.length >= 3, `expected the crawl steps, found ${crawls.length}`);
+  for (const step of crawls) {
+    assert.ok(
+      gated.some((candidate) => candidate.name === step.name),
+      `"${step.name}" crawls without checking whether this slot should run`
+    );
+  }
+});
+
+test('the gate runs before anything is fetched from the network', () => {
+  const all = steps(raw);
+  const gateIndex = all.findIndex((step) => /publish-retry-gate\.mjs/.test(step.body));
+  assert.ok(gateIndex >= 0, 'no step runs the retry gate');
+  for (const step of all) {
+    if (step.name === 'Checkout this repository' || step.name === 'Setup Node.js') continue;
+    if (step.name === all[gateIndex].name) continue;
+    const index = all.indexOf(step);
+    if (index > gateIndex) continue;
+    assert.ok(
+      /actions\/checkout|setup-node/.test(step.body),
+      `"${step.name}" runs before the gate without being a checkout/setup step`
+    );
+  }
+});
+
+test('the chain has the permission its dispatch needs', () => {
+  // `gh api repos/.../dispatches` with the job's own token needs actions:write;
+  // `contents: read` alone answers 403 and the ladder silently stops at one.
+  assert.match(raw, /^permissions:\n(?:  .*\n)*?  actions: write$/m, 'the job cannot dispatch its next slot');
+});
+
+test('a crawl that finishes without publishing dispatches the next slot', () => {
+  const chain = steps(raw).find((step) => /dispatches/.test(step.body) && /client_payload/.test(step.body));
+  assert.ok(chain, 'nothing dispatches the next slot');
+  assert.match(chain.body, /--next/, 'the chain step does not derive the next attempt number');
+  assert.match(chain.body, /steps\.verify\.outcome/, 'the chain cannot tell a published attempt from a held one');
+});
