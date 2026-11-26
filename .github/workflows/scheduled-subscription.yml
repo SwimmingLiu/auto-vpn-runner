@@ -102,10 +102,13 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           RETRY_PAYLOAD: ${{ toJSON(github.event.client_payload || fromJSON('{}')) }}
         run: |
+          # The script prints `run: <reason>` or `skip: <reason>` itself. A step
+          # cannot read its own `outputs` — `${{ steps.slot.outputs.reason }}`
+          # here would always interpolate empty and show up in the log as a
+          # bare `slot: `.
           node runner/scripts/publish-retry-gate.mjs \
             --workflow scheduled-subscription.yml \
             --payload "$RETRY_PAYLOAD"
-          echo "slot: ${{ steps.slot.outputs.reason }}"
 
       # A chained slot is due at an exact time. Sleeping at the head of the run
       # keeps the ladder's pauses honest even when the crawl that dispatched it

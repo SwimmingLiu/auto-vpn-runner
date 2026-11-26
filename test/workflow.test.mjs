@@ -226,3 +226,24 @@ test('a skipped slot does not try to redact logs it never produced', () => {
   assert.ok(step, 'nothing redacts the log');
   assert.match(step.body, /steps\.slot\.outputs\.run == 'true'/, 'redaction runs even when the slot was skipped');
 });
+
+test('no step reads its own outputs', () => {
+  // `${{ steps.<self>.outputs.* }}` inside the step that sets them is always
+  // empty — GitHub resolves outputs after the step finishes. A live chained run
+  // logged a bare `slot: ` because of it.
+  for (const step of steps(raw)) {
+    const id = /^\s{8}id: (\S+)$/m.exec(step.body)?.[1];
+    if (!id) continue;
+    // The gate's own comment names the expression it warns about, so judge the
+    // executable lines only.
+    const executable = step.body
+      .split('\n')
+      .filter((line) => !/^\s*#/.test(line))
+      .join('\n');
+    assert.doesNotMatch(
+      executable,
+      new RegExp(`steps\\.${id}\\.outputs`),
+      `"${step.name}" reads steps.${id}.outputs from inside itself; that is always empty`
+    );
+  }
+});
