@@ -12,18 +12,39 @@
  *
  *   - A manual dispatch always runs. The operator asked for it, and a manual
  *     run is not one of the campaign's attempts.
- *   - If any attempt in the window published, every later slot exits in
- *     seconds instead of crawling again.
+ *   - If any run in the campaign published, every later slot exits in seconds
+ *     instead of crawling again.
  *   - At most ten attempts start in one campaign.
  *   - After the nth attempt the next one waits 30 min × 2^(n-1): 30 min, 1 h,
  *     2 h, 4 h, 8 h. The wait is measured from when the attempt *finished*, so
  *     a long crawl does not eat into the pause that follows it.
  *
+ * What counts as an attempt is a run that actually measured: a slot the gate
+ * turned down, a run cancelled while queued, and a run that died before the
+ * crawl all leave the count and the pause clock alone. Counting those punished
+ * the night twice — once for a chance it never used, and again for the pause it
+ * imposed on the next one.
+ *
+ * A pause longer than one job can hold is still honoured. A GitHub-hosted job
+ * is killed at 360 minutes, so a slot asked to wait longer than it can wait and
+ * still crawl does not crawl at all: it sleeps as much as the job allows, hands
+ * its number and its due time to a successor, and exits. Two or three such
+ * waiters carry an eight-hour pause across jobs without the ladder ever running
+ * early — which is the thing the pause exists to prevent.
+ *
+ * Campaign membership is decided by when a run was *active*, not only by when
+ * it was created. A chained slot created at 18:30 and publishing at 23:05
+ * straddles the 20:15 anchor; keyed on creation alone it is invisible to the
+ * campaign it lands in, and the next slot crawls over the subscription it just
+ * published.
+ *
  * The run history is the only state, so a lost slot, a cancelled run or a
  * re-run cannot desynchronise a counter: the gate reads what actually happened
  * from the API every time. The chain carries its own bookkeeping in the
  * dispatch payload (`attempt`, `due_at`) precisely so the child does not have
- * to race its parent's row flipping to `completed`.
+ * to race its parent's row flipping to `completed`. The payload is a hint, not
+ * the truth: the attempt number is never allowed to fall below the history's,
+ * and a pause the history has since enlarged wins over a stale `due_at`.
  *
  * Exit codes: 0 the decision was made; 2 the gate could not read the history.
  * A slot that cannot decide must not crawl — an unguarded retry is how ten
@@ -57,15 +78,32 @@ export const CRAWL_BUDGET_MINUTES = 150;
 /** Checkout, setup, upload and the log redaction. */
 export const JOB_OVERHEAD_MINUTES = 10;
 /**
- * Longest pause a run will sit through.
+ * Longest pause a run will sit through *and then crawl*.
  *
  * A pause beyond this cannot be honoured inside the run that is asked to wait:
  * the job would be cancelled mid-crawl, which loses the attempt *and* the next
- * slot's dispatch. The ladder's useful part (30 min, 1 h, 2 h) is well inside;
- * by the fourth pause the night is nearly over, and running as soon as the cap
- * expires is the same decision the full pause would have reached.
+ * slot's dispatch. Such a slot becomes a waiter instead — see below.
  */
 export const MAX_WAIT_MINUTES = JOB_TIMEOUT_MINUTES - CRAWL_BUDGET_MINUTES - JOB_OVERHEAD_MINUTES;
+/** A waiter only sleeps, hands off and exits; it needs no crawl budget. */
+export const WAITER_OVERHEAD_MINUTES = 15;
+/**
+ * Longest pause a waiter will sit through.
+ *
+ * Withdrawal leaves the successor enough of the job to check out, run the gate
+ * and post one dispatch. Eight hours is three hops at this cap.
+ */
+export const MAX_WAITER_MINUTES = JOB_TIMEOUT_MINUTES - WAITER_OVERHEAD_MINUTES;
+/**
+ * How far back the campaign scan looks for runs that straddle the anchor.
+ *
+ * A run is never longer than one job (360 minutes); twelve hours is a wide
+ * margin around that, and costs one API page.
+ */
+export const CAMPAIGN_LOOKBACK_MS = 12 * 60 * 60 * 1000;
+
+/** Events that count as one of the campaign's attempts. */
+export const ATTEMPT_EVENTS = Object.freeze(['schedule', 'repository_dispatch']);
 
 /** The campaign window containing `now`. */
 export function campaignWindow(nowMs) {
@@ -97,7 +135,9 @@ export function backoffAfter(completedAttempts) {
  * The workflow publishes no state for this: "Publish" and "Verify what is
  * actually served" only run when the floor was cleared, and "Report a held
  * night" only runs when it was not. Skipped steps are reported as such, which
- * is exactly the signal needed.
+ * is exactly the signal needed. A step set that says nothing — a run cancelled
+ * while queued, a gate that could not read the history — classifies as
+ * `unknown` and is not counted as an attempt.
  */
 export function classifyRun(jobSteps) {
   const steps = Array.isArray(jobSteps) ? jobSteps : [];
@@ -108,61 +148,91 @@ export function classifyRun(jobSteps) {
   return 'unknown';
 }
 
-/** Events that count as one of the campaign's attempts. */
-export const ATTEMPT_EVENTS = Object.freeze(['schedule', 'repository_dispatch']);
+/** Did this outcome cost the campaign one of its chances? */
+function isAttempt(outcome) {
+  return outcome === 'held' || outcome === 'failed';
+}
 
 function isoSeconds(ms) {
   return new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
 }
 
-async function apiGet(fetchImpl, url, token) {
-  const response = await fetchImpl(url, {
-    headers: {
-      authorization: `Bearer ${token}`,
-      accept: 'application/vnd.github+json',
-      'x-github-api-version': '2022-11-28'
+/** Pauses between GET attempts; a transient 5xx must not end the night. */
+export const API_RETRY_DELAYS_MS = Object.freeze([0, 2000, 5000, 10000]);
+
+async function apiGet(fetchImpl, url, token, sleep) {
+  let lastError = null;
+  for (const delay of API_RETRY_DELAYS_MS) {
+    if (delay > 0) await sleep(delay);
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      const response = await fetchImpl(url, {
+        headers: {
+          authorization: `Bearer ${token}`,
+          accept: 'application/vnd.github+json',
+          'x-github-api-version': '2022-11-28'
+        }
+      });
+      if (response.ok) {
+        // eslint-disable-next-line no-await-in-loop
+        return await response.json();
+      }
+      const error = new Error(`GET ${url} answered ${response.status}`);
+      // 403 and 404 will not heal on a second call; only rate limits and
+      // server errors are worth another try.
+      if (response.status < 500 && response.status !== 429) throw Object.assign(error, { fatal: true });
+      lastError = error;
+    } catch (error) {
+      if (error?.fatal) throw error;
+      lastError = error;
     }
-  });
-  if (!response.ok) {
-    throw new Error(`GET ${url} answered ${response.status}`);
   }
-  return response.json();
+  throw lastError ?? new Error(`GET ${url} failed`);
 }
 
-/** Every run of the workflow created inside the window, as the API lists it. */
+/**
+ * Every run that was active inside the window, as the API lists it.
+ *
+ * Selected by creation *or* by last update: a run created before the anchor
+ * whose crawl and publish finish after it belongs to the campaign it finished
+ * in, and keying on creation alone would let the next slot crawl over the
+ * subscription it just published.
+ */
 export async function readCampaign(fetchImpl, options) {
-  const { token, repository, workflow, startMs, endMs, currentRunId } = options;
+  const { token, repository, workflow, startMs, endMs, sleep = async () => {} } = options;
+  const lookbackMs = options.lookbackMs ?? CAMPAIGN_LOOKBACK_MS;
   const base = `https://api.github.com/repos/${repository}/actions/workflows/${encodeURIComponent(workflow)}/runs`;
   const runs = [];
   let page = 1;
   for (;;) {
-    const url = `${base}?created=${encodeURIComponent(`>=${isoSeconds(startMs)}`)}&per_page=100&page=${page}`;
-    const payload = await apiGet(fetchImpl, url, token);
+    const url = `${base}?created=${encodeURIComponent(`>=${isoSeconds(startMs - lookbackMs)}`)}&per_page=100&page=${page}`;
+    // eslint-disable-next-line no-await-in-loop
+    const payload = await apiGet(fetchImpl, url, token, sleep);
     const batch = Array.isArray(payload?.workflow_runs) ? payload.workflow_runs : [];
     for (const run of batch) {
       const created = Date.parse(String(run?.created_at ?? ''));
-      if (!Number.isFinite(created) || created < startMs || created >= endMs) continue;
+      if (!Number.isFinite(created) || created >= endMs) continue;
+      const updated = Date.parse(String(run?.updated_at ?? ''));
+      if (created < startMs && !(Number.isFinite(updated) && updated >= startMs)) continue;
       runs.push(run);
     }
     if (batch.length < 100) break;
     page += 1;
     if (page > 10) break;
   }
-  return runs
-    .filter((run) => String(run?.id) !== String(currentRunId ?? ''))
-    .map((run) => ({
-      id: run.id,
-      event: run.event,
-      status: run.status,
-      conclusion: run.conclusion,
-      createdAt: run.created_at,
-      updatedAt: run.updated_at
-    }));
+  return runs.map((run) => ({
+    id: run.id,
+    event: run.event,
+    status: run.status,
+    conclusion: run.conclusion,
+    createdAt: run.created_at,
+    updatedAt: run.updated_at
+  }));
 }
 
-async function outcomeOf(fetchImpl, token, repository, runId) {
+async function outcomeOf(fetchImpl, token, repository, runId, sleep) {
   const url = `https://api.github.com/repos/${repository}/actions/runs/${runId}/jobs?per_page=100`;
-  const payload = await apiGet(fetchImpl, url, token);
+  const payload = await apiGet(fetchImpl, url, token, sleep);
   const jobs = Array.isArray(payload?.jobs) ? payload.jobs : [];
   const steps = jobs.flatMap((job) => (Array.isArray(job?.steps) ? job.steps : []));
   return classifyRun(steps);
@@ -175,10 +245,10 @@ function minutesBetween(fromMs, toMs) {
 /**
  * The decision for one slot.
  *
- * `run: false` is the normal answer for most slots; the caller exits without
- * crawling. `waitMinutes` is how long the run should sleep before its first
- * step touches the network, and `chain` says whether the run should dispatch
- * a successor when it finishes.
+ * `run: true` means crawl. `waiter: true` means sleep `waitMinutes`, hand the
+ * slot to a successor unchanged, and exit without crawling. `chain` says
+ * whether this run dispatches anything at all. `dueAt` is the absolute time the
+ * slot is due, carried to a waiter's successor.
  */
 export async function decide(options) {
   const {
@@ -187,124 +257,150 @@ export async function decide(options) {
     token,
     repository,
     workflow,
-    currentRunId,
+    currentRunId = '',
     eventName = '',
     payload = {},
     maxAttempts = MAX_ATTEMPTS,
-    maxWaitMinutes = MAX_WAIT_MINUTES
+    maxWaitMinutes = MAX_WAIT_MINUTES,
+    maxWaiterMinutes = MAX_WAITER_MINUTES,
+    sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
   } = options;
 
+  const skip = (reason, extra = {}) => ({
+    run: false,
+    waiter: false,
+    chain: false,
+    attempt: 0,
+    attempts: 0,
+    waitMinutes: 0,
+    dueAt: null,
+    reason,
+    ...extra
+  });
+
   if (eventName === 'workflow_dispatch') {
-    return { run: true, chain: false, attempt: 0, attempts: 0, waitMinutes: 0, reason: 'manual dispatch' };
+    return { run: true, waiter: false, chain: false, attempt: 0, attempts: 0, waitMinutes: 0, dueAt: null, reason: 'manual dispatch' };
   }
 
   const { startMs, endMs } = campaignWindow(nowMs);
   const chained = eventName === 'repository_dispatch';
-  const chainedAttempt = Number(payload?.attempt ?? 0);
-  const dueAtMs = Date.parse(String(payload?.due_at ?? ''));
-  const parentRunId = String(payload?.parent_run_id ?? '');
 
-  if (!token) {
-    return { run: false, chain: false, attempt: 0, attempts: 0, waitMinutes: 0, reason: 'no GITHUB_TOKEN; refusing to retry blindly' };
-  }
-  if (!repository) {
-    return { run: false, chain: false, attempt: 0, attempts: 0, waitMinutes: 0, reason: 'no GITHUB_REPOSITORY; refusing to retry blindly' };
-  }
+  if (!token) return skip('no GITHUB_TOKEN; refusing to retry blindly');
+  if (!repository) return skip('no GITHUB_REPOSITORY; refusing to retry blindly');
 
-  const runs = await readCampaign(fetchImpl, { token, repository, workflow, startMs, endMs, currentRunId });
-  const attempted = runs.filter((run) => ATTEMPT_EVENTS.includes(String(run?.event ?? '')));
+  const runs = await readCampaign(fetchImpl, { token, repository, workflow, startMs, endMs, sleep });
 
-  // A run that is mid-crawl holds every other slot. The parent is exempt: it is
-  // the run that dispatched this one, so it is finished or finishing, and its
-  // row flipping to `completed` is a race this gate must not lose.
-  const inFlight = runs.filter((run) => run.status !== 'completed' && String(run.id) !== parentRunId);
-  if (inFlight.length > 0) {
-    return {
-      run: false,
-      chain: false,
-      attempt: 0,
-      attempts: 0,
-      waitMinutes: 0,
-      reason: `run ${inFlight[0].id} is still ${inFlight[0].status}`
-    };
+  // A run that is *executing* holds every other slot: it shares this
+  // concurrency group, so it is mid-crawl and a second one would race it for
+  // the same Pages deployment. A *queued* run does not hold anything — it
+  // starts only after this one ends — and treating it as in-flight lost the
+  // chained slot that was already due. This run and the run that dispatched it
+  // are exempt: both are finished or finishing, and waiting for their rows to
+  // flip is a race the gate must not lose.
+  const exempt = new Set([String(currentRunId ?? ''), String(payload?.parent_run_id ?? '')].filter(Boolean));
+  const active = runs.filter((run) =>
+    run.status !== 'completed' && (run.status === 'in_progress' || run.status === 'waiting') && !exempt.has(String(run.id))
+  );
+  if (active.length > 0) {
+    return skip(`run ${active[0].id} is still ${active[0].status}`);
   }
 
-  // Every run in the window, the parent included. A manual run that publishes
-  // has done the night's work, and a later slot that crawled anyway would
-  // replace a fresh subscription with another hour of work; the same holds for
-  // the run that dispatched this one. The parent is exempt from the in-flight
-  // guard above because its row may still read `in_progress` while this one
-  // decides, but it is *not* exempt from this: a parent that already published
-  // means the campaign is over, and the successor must exit rather than crawl.
-  // (A live chained slot with a published parent answered "run" before this.)
+  // Every finished run in the window, whatever its event: a manual run that
+  // published has done the night's work, and a later slot that crawled anyway
+  // would replace a fresh subscription with another hour of work. A run still
+  // unfinished was handled above; its outcome is unreadable, not published.
+  const outcomes = [];
   for (const run of runs) {
+    if (run.status !== 'completed') continue;
     // eslint-disable-next-line no-await-in-loop
-    const outcome = await outcomeOf(fetchImpl, token, repository, run.id);
-    if (outcome === 'published') {
-      return {
-        run: false,
-        chain: false,
-        attempt: 0,
-        attempts: attempted.length,
-        waitMinutes: 0,
-        reason: `run ${run.id} published; the campaign is done`
-      };
-    }
+    const outcome = await outcomeOf(fetchImpl, token, repository, run.id, sleep);
+    outcomes.push({ run, outcome });
   }
 
-  // A chained slot inherits its number from the parent's payload: counting from
-  // the API would be off by one for as long as the parent's row reads
-  // `in_progress`, and the campaign's ceiling must not depend on that timing.
-  const attempt = chained && chainedAttempt > 0 ? chainedAttempt : attempted.length + 1;
+  const published = outcomes.find((entry) => entry.outcome === 'published');
+  if (published) {
+    return skip(`run ${published.run.id} published; the campaign is done`);
+  }
+
+  // Only scheduled and chained slots spend the campaign's chances; a manual
+  // crawl is the operator's, and a run that never reached a crawl (skipped,
+  // cancelled early, gate failure) spent nothing.
+  const attempts = outcomes.filter((entry) => ATTEMPT_EVENTS.includes(String(entry.run?.event ?? '')) && isAttempt(entry.outcome));
+
+  const chainedAttempt = Number(payload?.attempt ?? 0);
+  // The payload is a hint, the history is the record: a cron slot that crawled
+  // while this one sat queued must not let the number go backwards.
+  const attempt = Math.max(chainedAttempt > 0 ? chainedAttempt : 0, attempts.length + 1);
 
   if (attempt > maxAttempts) {
-    return {
-      run: false,
-      chain: false,
+    return skip(`attempt ${attempt} exceeds the campaign ceiling of ${maxAttempts}`, { attempt, attempts: attempts.length });
+  }
+
+  const lastFinishedMs = attempts.reduce((latest, entry) => {
+    const ended = Date.parse(String(entry.run.updatedAt ?? ''));
+    return Number.isFinite(ended) && ended > latest ? ended : latest;
+  }, startMs);
+  const fromHistoryMs = attempts.length > 0
+    ? Math.max(0, lastFinishedMs + backoffAfter(attempts.length) - nowMs)
+    : 0;
+
+  const dueAtMs = chained ? Date.parse(String(payload?.due_at ?? '')) : NaN;
+  const fromPayloadMs = chained && Number.isFinite(dueAtMs) ? Math.max(0, dueAtMs - nowMs) : 0;
+
+  // Whichever pause is longer wins. A `due_at` older than the last crawl's
+  // finish is stale — a cron slot crawled in between — and honouring it would
+  // run two crawls back to back.
+  const remainingMs = Math.max(fromHistoryMs, fromPayloadMs);
+  const dueAt = new Date(nowMs + remainingMs).toISOString();
+  const waitMinutes = minutesBetween(nowMs, nowMs + remainingMs);
+
+  if (remainingMs > 0 && nowMs + remainingMs >= endMs) {
+    return skip('the next pause runs past the end of the campaign; the next anchor starts a fresh one', {
       attempt,
-      attempts: attempted.length,
-      waitMinutes: 0,
-      reason: `attempt ${attempt} exceeds the campaign ceiling of ${maxAttempts}`
+      attempts: attempts.length
+    });
+  }
+
+  if (waitMinutes <= maxWaitMinutes) {
+    // The successor is due one pause after this crawl finishes, which is at
+    // least one pause after now. If even that lands past the anchor there is
+    // nothing to chain: the next slot would only read the window, say so, and
+    // exit. A dispatch that is known to be a no-op is one more row on the run
+    // list for no chance at all.
+    const chain = nowMs + backoffAfter(attempt) < endMs;
+    const base = attempt === 1
+      ? 'first attempt of the campaign'
+      : `attempt ${attempt} of ${maxAttempts}` + (waitMinutes > 0 ? `, after a ${waitMinutes} min pause` : '');
+    return {
+      run: true,
+      waiter: false,
+      chain,
+      attempt,
+      attempts: attempts.length,
+      waitMinutes,
+      dueAt,
+      reason: chain ? base : `${base}; the next pause would land past the campaign's end, so this is the last slot`
     };
   }
 
-  let waitMinutes = 0;
-  if (chained && Number.isFinite(dueAtMs) && dueAtMs > nowMs) {
-    waitMinutes = Math.min(minutesBetween(nowMs, dueAtMs), maxWaitMinutes);
-  } else if (!chained) {
-    // A cron slot has no payload, so the pause is derived from when the last
-    // attempt finished. Without a previous attempt there is nothing to wait for.
-    const finishedMs = attempted.reduce((latest, run) => {
-      const ended = Date.parse(String(run.updatedAt ?? ''));
-      return Number.isFinite(ended) && ended > latest ? ended : latest;
-    }, startMs);
-    const pause = backoffAfter(attempted.length);
-    if (attempted.length > 0 && nowMs < finishedMs + pause) {
-      return {
-        run: false,
-        chain: false,
-        attempt,
-        attempts: attempted.length,
-        waitMinutes: 0,
-        reason: `attempt ${attempted.length} finished ${minutesBetween(finishedMs, nowMs)} min ago; ` +
-          `the next pause is ${Math.round(pause / 60_000)} min`
-      };
-    }
-  }
-
+  // The pause is longer than one job can hold and still crawl — the four- and
+  // eight-hour rungs of the ladder. Sleep what this job can afford, hand the
+  // number and the due time to a successor, and let it finish the pause. The
+  // successor may itself be a waiter; eight hours is three hops.
+  const waiterMinutes = Math.min(waitMinutes, maxWaiterMinutes);
   return {
-    run: true,
+    run: false,
+    waiter: true,
     chain: true,
     attempt,
-    attempts: attempted.length,
-    waitMinutes,
-    reason: attempt === 1
-      ? 'first attempt of the campaign'
-      : `attempt ${attempt} of ${maxAttempts}` + (waitMinutes > 0 ? `, after a ${waitMinutes} min pause` : '')
+    attempts: attempts.length,
+    waitMinutes: waiterMinutes,
+    dueAt,
+    reason: `attempt ${attempt} is due in ${waitMinutes} min; waiting ${waiterMinutes} min here and handing the slot on`
   };
 }
 
-/** The payload the chain hands to its successor. */
+/** The payload the chain hands to its successor after this attempt finished. */
 export function nextSlotPayload({ attempt, nowMs }) {
   return {
     attempt: attempt + 1,
@@ -313,15 +409,26 @@ export function nextSlotPayload({ attempt, nowMs }) {
   };
 }
 
+/** The payload a waiter hands on: same slot, same due time, new parent. */
+export function handoffPayload({ attempt, dueAt }) {
+  return {
+    attempt,
+    due_at: String(dueAt ?? ''),
+    parent_run_id: String(process.env.GITHUB_RUN_ID ?? '')
+  };
+}
+
 function parseArgs(argv) {
-  const args = { json: false, payload: {}, next: false, attempt: 0 };
+  const args = { json: false, payload: {}, next: false, handoff: false, attempt: 0, dueAt: null };
   for (let index = 2; index < argv.length; index += 1) {
     const token = argv[index];
     if (token === '--json') args.json = true;
     else if (token === '--next') args.next = true;
+    else if (token === '--handoff') args.handoff = true;
     else if (token === '--workflow') args.workflow = argv[++index];
     else if (token === '--max-attempts') args.maxAttempts = Number(argv[++index]);
     else if (token === '--attempt') args.attempt = Number(argv[++index]);
+    else if (token === '--due-at') args.dueAt = argv[++index];
     else if (token === '--payload') args.payload = JSON.parse(argv[++index] ?? '{}');
   }
   return args;
@@ -334,6 +441,11 @@ async function main() {
     // this attempt's, so the successor's is one more; the due time is one
     // backoff after *this* moment, which is when this attempt finished.
     process.stdout.write(`${JSON.stringify(nextSlotPayload({ attempt: args.attempt, nowMs: Date.now() }))}\n`);
+    return;
+  }
+  if (args.handoff) {
+    // A waiter hands on the slot it was given, untouched.
+    process.stdout.write(`${JSON.stringify(handoffPayload({ attempt: args.attempt, dueAt: args.dueAt }))}\n`);
     return;
   }
   const decision = await decide({
@@ -349,14 +461,22 @@ async function main() {
   if (args.json) {
     process.stdout.write(`${JSON.stringify(decision)}\n`);
   } else {
-    process.stdout.write(`${decision.run ? 'run' : 'skip'}: ${decision.reason}\n`);
+    process.stdout.write(`${decision.run ? 'run' : decision.waiter ? 'wait' : 'skip'}: ${decision.reason}\n`);
   }
   if (process.env.GITHUB_OUTPUT) {
     const fs = await import('node:fs');
     const reason = String(decision.reason).replace(/\r?\n/g, ' ');
     fs.appendFileSync(
       process.env.GITHUB_OUTPUT,
-      [`run=${decision.run}`, `chain=${decision.chain}`, `attempt=${decision.attempt}`, `wait_minutes=${decision.waitMinutes}`, `reason=${reason}`].join('\n') + '\n'
+      [
+        `run=${decision.run}`,
+        `waiter=${decision.waiter}`,
+        `chain=${decision.chain}`,
+        `attempt=${decision.attempt}`,
+        `wait_minutes=${decision.waitMinutes}`,
+        `due_at=${decision.dueAt ?? ''}`,
+        `reason=${reason}`
+      ].join('\n') + '\n'
     );
   }
 }
@@ -369,7 +489,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     process.stderr.write(`retry gate: ${error?.message ?? error}\n`);
     try {
       const fs = process.getBuiltinModule ? process.getBuiltinModule('node:fs') : null;
-      fs?.appendFileSync(process.env.GITHUB_OUTPUT, 'run=false\nchain=false\nwait_minutes=0\nreason=the run history could not be read\n');
+      fs?.appendFileSync(process.env.GITHUB_OUTPUT, 'run=false\nwaiter=false\nchain=false\nwait_minutes=0\nreason=the run history could not be read\n');
     } catch {
       // the output file is best-effort; the non-zero exit is the signal
     }
