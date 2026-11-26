@@ -354,17 +354,23 @@ jobs:
             node cloudflare/scripts/redact-run-log.mjs \
               "$RUNNER_TEMP/deploy.jsonl" "$RUNNER_TEMP/deploy.redacted.jsonl"
           fi
+          leaked=0
           for f in "$RUNNER_TEMP"/run.redacted.jsonl "$RUNNER_TEMP"/deploy.redacted.jsonl; do
             [ -f "$f" ] || continue
             if grep -qE '(vmess|vless|trojan|ss|hysteria2?)://[A-Za-z0-9_-]' "$f"; then
-              # The upload below runs on `always()`; leaving the file here would
-              # publish exactly what this check refused. A failure with nothing
-              # to upload is the safe outcome.
-              rm -f "$f"
-              echo "::error::a node link survived redaction in $f; the file was deleted, not uploaded" >&2
-              exit 1
+              echo "a node link survived redaction in $f" >&2
+              leaked=1
             fi
           done
+          if [ "$leaked" -ne 0 ]; then
+            # The upload below runs on `always()`, so *every* candidate has to
+            # go, not just the one that matched first: the sibling has not been
+            # checked yet and would be published unexamined. A failure with
+            # nothing to upload is the safe outcome.
+            rm -f "$RUNNER_TEMP"/run.redacted.jsonl "$RUNNER_TEMP"/deploy.redacted.jsonl
+            echo "::error::a node link survived redaction; the logs were deleted, not uploaded" >&2
+            exit 1
+          fi
 
       # The ladder's next slot. Dispatched at the end of an attempt so the pause
       # is measured from when the crawl finished, and only when this attempt did
@@ -386,6 +392,7 @@ jobs:
           ATTEMPT: ${{ steps.slot.outputs.attempt }}
           WAITER: ${{ steps.slot.outputs.waiter }}
           DUE_AT: ${{ steps.slot.outputs.due_at }}
+          MEASURED: ${{ steps.measure.outcome }}
           PUBLISHED_HERE: ${{ steps.verify.outcome == 'success' }}
         run: |
           # A run that already published has nothing left to chain; the
@@ -400,6 +407,13 @@ jobs:
             # same attempt number and the same due time, so no chance is spent
             # and no crawl starts early.
             payload="$(node runner/scripts/publish-retry-gate.mjs --handoff --attempt "$ATTEMPT" --due-at "$DUE_AT")"
+          elif [ "$MEASURED" != "success" ] && [ "$MEASURED" != "failure" ]; then
+            # The slot died before it measured — a registry 5xx in the build, a
+            # missing secret. It spent no chance and earned no pause, so it
+            # hands on the *same* slot with no due time and the successor
+            # recomputes both from the history. `--next` here would charge the
+            # night an attempt it never took and start the next pause early.
+            payload="$(node runner/scripts/publish-retry-gate.mjs --handoff --attempt "$ATTEMPT")"
           else
             payload="$(node runner/scripts/publish-retry-gate.mjs --next --attempt "$ATTEMPT")"
           fi

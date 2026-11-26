@@ -406,6 +406,79 @@ test('a crawl that failed is an attempt', async () => {
   assert.equal(decision.waitMinutes, 25, 'the pause runs from the failed crawl, not from nothing');
 });
 
+test('a run that measured and then failed at Publish still spends its chance', async () => {
+  // Seventy-five minutes were measured and the floor was cleared; the run died
+  // on the way out. Classifying that as "nothing happened" let a later slot
+  // crawl minutes after it, inside the pause it had earned, and let ten such
+  // runs pass the ceiling uncounted.
+  const publishFailed = [
+    { name: 'Measure', conclusion: 'success' },
+    { name: 'Report a held night', conclusion: 'skipped' },
+    { name: 'Publish', conclusion: 'failure' },
+    { name: 'Verify what is actually served', conclusion: 'skipped' }
+  ];
+  const failed = run(1, ANCHOR + 5 * MINUTE, { updatedAt: ANCHOR + 80 * MINUTE });
+  const { fetchImpl } = fakeApi([failed], { 1: publishFailed });
+  const decision = await decide({ ...base, nowMs: ANCHOR + 90 * MINUTE, fetchImpl });
+  assert.equal(decision.attempt, 2);
+  assert.equal(decision.waitMinutes, 20, 'the pause runs from when that run finished');
+});
+
+test('a handoff with no due time paces itself from the history alone', async () => {
+  // What a slot that died before it measured hands on: the same number, no due
+  // time. The successor must not invent a pause from a failure that measured
+  // nothing — it reads the last real crawl and finds the wait already served.
+  const { runs, jobs } = heldRuns(5, ANCHOR + 9 * HOUR);
+  const { fetchImpl } = fakeApi(runs, jobs);
+  const decision = await decide({
+    ...base,
+    eventName: 'repository_dispatch',
+    payload: { attempt: 6, due_at: '', parent_run_id: '5' },
+    nowMs: ANCHOR + 18 * HOUR,
+    fetchImpl
+  });
+  assert.equal(decision.attempt, 6);
+  assert.equal(decision.run, true);
+  assert.equal(decision.waitMinutes, 0, 'the eight-hour pause after attempt 5 has long expired');
+});
+
+test('a payload from the previous campaign does not number this one', async () => {
+  // A waiter's sleep can cross the 20:15 anchor — a pause due at 20:14 wakes
+  // and hands off at 20:15. The number and due time it carries belong to the
+  // night that just ended; inheriting them starts the new campaign halfway up
+  // the ladder, with two crawls left before its ceiling.
+  const { fetchImpl } = fakeApi([]);
+  const decision = await decide({
+    ...base,
+    eventName: 'repository_dispatch',
+    payload: { attempt: 6, due_at: new Date(ANCHOR - 60_000).toISOString(), parent_run_id: '42' },
+    nowMs: ANCHOR + 20_000,
+    fetchImpl
+  });
+  assert.equal(decision.attempt, 1, 'the new campaign starts counting from one');
+  assert.equal(decision.run, true);
+  assert.equal(decision.waitMinutes, 0);
+});
+
+test('a parent that straddles the anchor speaks for the campaign it finishes in', async () => {
+  // Created before the anchor, finished after it: the run is in this window,
+  // but its number was the previous campaign's. The history counts it as this
+  // campaign's first attempt, so the next one is two.
+  const straddler = run(1, ANCHOR - 2 * HOUR, {
+    event: 'repository_dispatch',
+    updatedAt: ANCHOR + 10 * MINUTE
+  });
+  const { fetchImpl } = fakeApi([straddler], { 1: HELD_STEPS });
+  const decision = await decide({
+    ...base,
+    eventName: 'repository_dispatch',
+    payload: { attempt: 7, due_at: new Date(ANCHOR + 5 * MINUTE).toISOString(), parent_run_id: '1' },
+    nowMs: ANCHOR + 15 * MINUTE,
+    fetchImpl
+  });
+  assert.equal(decision.attempt, 2);
+});
+
 test('ten attempts in one campaign is the ceiling', async () => {
   const runs = [];
   const jobs = {};
@@ -544,6 +617,23 @@ test('the workflow declares the same job timeout the gate budgets for', async ()
   const workflow = readFileSync(new URL('../.github/workflows/scheduled-subscription.yml', import.meta.url), 'utf8');
   const declared = Number(/^\s{4}timeout-minutes:\s*(\d+)\s*$/m.exec(workflow)?.[1] ?? 0);
   assert.equal(declared, JOB_TIMEOUT_MINUTES, 'the workflow timeout and the gate budget disagree');
+});
+
+test('the gate runs when node is given a symlinked path to it', async () => {
+  // `import.meta.url` is resolved through symlinks; `process.argv[1]` is as it
+  // was spelled. Comparing them directly is empty on any path with a symlink
+  // in it — `/tmp` on macOS is one — so `--next` printed nothing and the chain
+  // step posted an empty payload.
+  const { mkdtempSync, symlinkSync } = await import('node:fs');
+  const { execFileSync } = await import('node:child_process');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const { fileURLToPath } = await import('node:url');
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'gate-link-'));
+  const link = path.join(dir, 'gate.mjs');
+  symlinkSync(fileURLToPath(new URL('../scripts/publish-retry-gate.mjs', import.meta.url)), link);
+  const out = execFileSync(process.execPath, [link, '--next', '--attempt', '2'], { encoding: 'utf8' });
+  assert.equal(JSON.parse(out).attempt, 3);
 });
 
 test('a chained slot whose parent published does not run', async () => {

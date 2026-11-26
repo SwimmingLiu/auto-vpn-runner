@@ -50,7 +50,9 @@
  * A slot that cannot decide must not crawl — an unguarded retry is how ten
  * crawls stack on one night — so 2 means "skip" and the caller says why.
  */
+import { realpathSync } from 'node:fs';
 import process from 'node:process';
+import { pathToFileURL } from 'node:url';
 
 /** 20:15 UTC — the campaign anchor, matching the source server's publish slot. */
 export const CAMPAIGN_HOUR_UTC = 20;
@@ -144,7 +146,12 @@ export function classifyRun(jobSteps) {
   const conclusionOf = (name) => steps.find((step) => String(step?.name ?? '') === name)?.conclusion ?? null;
   if (conclusionOf('Verify what is actually served') === 'success') return 'published';
   if (conclusionOf('Report a held night') === 'success') return 'held';
-  if (conclusionOf('Measure') === 'failure') return 'failed';
+  // A run that measured and then died at Publish or Verify spent the chance
+  // just the same: seventy-five minutes were measured, and a Verify failure may
+  // even have replaced the deployment. Only a step set that never reached
+  // Measure failed without spending one — that one has its own path below.
+  const measured = conclusionOf('Measure');
+  if (measured === 'success' || measured === 'failure') return 'failed';
   return 'unknown';
 }
 
@@ -327,7 +334,18 @@ export async function decide(options) {
   // cancelled early, gate failure) spent nothing.
   const attempts = outcomes.filter((entry) => ATTEMPT_EVENTS.includes(String(entry.run?.event ?? '')) && isAttempt(entry.outcome));
 
-  const chainedAttempt = Number(payload?.attempt ?? 0);
+  // A payload is the previous slot's bookkeeping for *its* campaign. A chained
+  // handoff can cross the 20:15 anchor — a pause due at 20:14 turns into a
+  // waiter that wakes at 20:15 — and the number and due time it carries belong
+  // to the night that just ended. Inheriting them starts the new campaign
+  // halfway up the ladder: its first pause is the old attempt's, and it can be
+  // two crawls from the ceiling before it does any work. Only a parent created
+  // inside this window can speak for this window.
+  const parentRunId = String(payload?.parent_run_id ?? '');
+  const parentRun = chained && parentRunId ? runs.find((run) => String(run.id) === parentRunId) : null;
+  const payloadInCampaign = Boolean(parentRun) && Date.parse(String(parentRun.createdAt ?? '')) >= startMs;
+
+  const chainedAttempt = payloadInCampaign ? Number(payload?.attempt ?? 0) : 0;
   // The payload is a hint, the history is the record: a cron slot that crawled
   // while this one sat queued must not let the number go backwards.
   const attempt = Math.max(chainedAttempt > 0 ? chainedAttempt : 0, attempts.length + 1);
@@ -344,8 +362,8 @@ export async function decide(options) {
     ? Math.max(0, lastFinishedMs + backoffAfter(attempts.length) - nowMs)
     : 0;
 
-  const dueAtMs = chained ? Date.parse(String(payload?.due_at ?? '')) : NaN;
-  const fromPayloadMs = chained && Number.isFinite(dueAtMs) ? Math.max(0, dueAtMs - nowMs) : 0;
+  const dueAtMs = payloadInCampaign ? Date.parse(String(payload?.due_at ?? '')) : NaN;
+  const fromPayloadMs = Number.isFinite(dueAtMs) ? Math.max(0, dueAtMs - nowMs) : 0;
 
   // Whichever pause is longer wins. A `due_at` older than the last crawl's
   // finish is stale — a cron slot crawled in between — and honouring it would
@@ -481,7 +499,23 @@ async function main() {
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+/**
+ * Is this file the program node was asked to run?
+ *
+ * Node resolves `import.meta.url` through symlinks, `process.argv[1]` as it was
+ * spelled. Comparing them directly is empty on any path with a symlink in it —
+ * `/tmp` on macOS is one — so `--next` would print nothing and the chain step
+ * would post an empty payload.
+ */
+function isEntrypoint() {
+  try {
+    return pathToFileURL(realpathSync(process.argv[1])).href === import.meta.url;
+  } catch {
+    return false;
+  }
+}
+
+if (isEntrypoint()) {
   main().catch((error) => {
     // A gate that cannot read the history must not crawl: an unguarded slot is
     // how ten crawls stack on one night. Say why and exit non-zero; the

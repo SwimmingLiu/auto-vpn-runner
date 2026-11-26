@@ -253,10 +253,28 @@ test('steps that run before the pipeline checkout do not inherit its directory',
 
 test('a redaction failure leaves nothing for the upload to publish', () => {
   // The upload runs on `always()` and uploads whatever is at the path. A guard
-  // that only exits non-zero still publishes the file it just refused.
+  // that only exits non-zero still publishes the file it just refused — and a
+  // guard that removes one file at a time publishes the sibling it had not
+  // examined yet.
   const redact = steps(raw).find((candidate) => /redact-run-log\.mjs/.test(candidate.body));
   assert.ok(redact, 'nothing redacts the log');
-  assert.match(redact.body, /rm -f "\$f"/, 'the file the guard refused is still there for the upload');
+  assert.match(redact.body, /leaked=1/, 'the guard exits on the first match instead of checking every file');
+  assert.match(
+    redact.body,
+    /rm -f "\$RUNNER_TEMP"\/run\.redacted\.jsonl "\$RUNNER_TEMP"\/deploy\.redacted\.jsonl/,
+    'only the file that matched is removed; the unexamined sibling is still uploaded'
+  );
+  assert.doesNotMatch(redact.body, /rm -f "\$f"/, 'removing one file at a time leaves the sibling');
+});
+
+test('a slot that died before measuring hands on the same slot', () => {
+  // A registry 5xx in the build spends no chance and earns no pause. Chaining
+  // `--next` from it charges the night an attempt it never took and starts the
+  // next pause from a failure that measured nothing.
+  const chain = steps(raw).find((step) => /dispatches/.test(step.body) && /client_payload/.test(step.body));
+  assert.ok(chain, 'nothing dispatches the next slot');
+  assert.match(chain.body, /MEASURED: \$\{\{ steps\.measure\.outcome \}\}/, 'the chain cannot tell a measured run from a dead one');
+  assert.match(chain.body, /"\$MEASURED" != "success"/, 'the chain treats a dead run as a spent attempt');
 });
 
 test('a gate that cannot read the history fails the run visibly', () => {
