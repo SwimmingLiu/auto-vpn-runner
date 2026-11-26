@@ -339,23 +339,36 @@ jobs:
       # dispatch into a no-op anyway, but not spending the dispatch keeps the
       # run list honest about how many chances the night actually took.
       - name: Chain the next slot
-        if: ${{ always() && steps.slot.outputs.run == 'true' && steps.slot.outputs.chain == 'true' }}
+        # `!cancelled()`, not `always()`: a failed crawl is exactly what the
+        # ladder exists for and must hand over to the next slot, but a run the
+        # operator cancelled must not spawn its successor.
+        if: ${{ !cancelled() && steps.slot.outputs.run == 'true' && steps.slot.outputs.chain == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           ATTEMPT: ${{ steps.slot.outputs.attempt }}
           PUBLISHED_HERE: ${{ steps.verify.outcome == 'success' }}
         run: |
-          payload="$(node runner/scripts/publish-retry-gate.mjs --next --attempt "$ATTEMPT")"
           # A run that already published has nothing left to chain; the
           # successor would read the publish and exit, but not firing it keeps
-          # the log readable.
+          # the run list honest.
           if [ "$PUBLISHED_HERE" = "true" ]; then
             echo "this attempt published; the ladder ends here"
             exit 0
           fi
+          payload="$(node runner/scripts/publish-retry-gate.mjs --next --attempt "$ATTEMPT")"
           echo "dispatching the next slot with $payload"
-          printf '{"event_type":"subscription-publish-retry","client_payload":%s}' "$payload" \
-            | gh api --method POST "repos/${GITHUB_REPOSITORY}/dispatches" --input -
+          # Three tries: this step is the only thing that keeps the ladder
+          # alive, and one 5xx would otherwise end the night's retries silently.
+          for attempt in 1 2 3; do
+            if printf '{"event_type":"subscription-publish-retry","client_payload":%s}' "$payload" \
+              | gh api --method POST "repos/${GITHUB_REPOSITORY}/dispatches" --input -; then
+              exit 0
+            fi
+            echo "dispatch attempt ${attempt} failed; retrying" >&2
+            sleep $(( attempt * 10 ))
+          done
+          echo "::error::the next slot could not be dispatched; the ladder stops here"
+          exit 1
 
       - name: Upload the run log
         if: ${{ always() && steps.slot.outputs.run == 'true' }}
