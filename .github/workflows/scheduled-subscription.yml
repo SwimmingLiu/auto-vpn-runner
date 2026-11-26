@@ -25,9 +25,23 @@ on:
     # 20:15 UTC — the slot the source server publishes on, so the two never
     # race for the same night.
     - cron: '15 20 * * *'
+    # Slack for a cron the scheduler delivers late or not at all: the gate
+    # turns these into no-ops once the campaign has published, and the retry
+    # chain carries the ladder either way.
+    - cron: '45 21 * * *'
+    - cron: '30 23 * * *'
+  # The chain's own event: the last step of an attempt dispatches the next
+  # slot, so the ladder does not depend on GitHub's cron delivering anything
+  # after the first run of the night.
+  repository_dispatch:
+    types: [subscription-publish-retry]
 
+# `contents: read` is all the run needs from the pipeline; the chain step posts
+# a repository_dispatch to this repository, which its own token may do with
+# `actions: write`.
 permissions:
   contents: read
+  actions: write
 
 # A publish replaces the whole Pages production deployment, so two runs must
 # never overlap.
@@ -48,7 +62,9 @@ jobs:
   publish:
     name: Measure and publish
     runs-on: ubuntu-24.04
-    timeout-minutes: 240
+    # 240 minutes of crawl budget plus the longest pause a chained slot sits
+    # through (the gate caps that at 200 minutes).
+    timeout-minutes: 420
     # No `environment:`: this repository owns these credentials outright, so
     # they live as repository secrets and variables. An environment here would
     # hide any secret added at repository level behind a scope this job never
@@ -57,19 +73,53 @@ jobs:
       run:
         working-directory: source
     steps:
-      - name: Checkout the pipeline
+      # This repository is checked out first: its gate decides whether the
+      # pipeline even needs to be fetched.
+      - name: Checkout this repository
         uses: actions/checkout@v4
         with:
-          repository: swimmingliu/auto-vpn
-          ref: ${{ env.PIPELINE_REF }}
-          path: source
+          path: runner
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 24
 
+      # Which slot this is, read from the campaign's own run history. A manual
+      # dispatch always runs; a campaign that already published ends here; a
+      # slot inside the backoff window exits in seconds instead of starting a
+      # seventy-five-minute crawl. `RETRY_PAYLOAD` is the parent's dispatch
+      # body, empty for cron and manual runs.
+      - name: Decide whether this slot runs
+        id: slot
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RETRY_PAYLOAD: ${{ toJSON(github.event.client_payload || fromJSON('{}')) }}
+        run: |
+          node runner/scripts/publish-retry-gate.mjs \
+            --workflow scheduled-subscription.yml \
+            --payload "$RETRY_PAYLOAD"
+          echo "slot: ${{ steps.slot.outputs.reason }}"
+
+      # A chained slot is due at an exact time. Sleeping at the head of the run
+      # keeps the ladder's pauses honest even when the crawl that dispatched it
+      # finished late.
+      - name: Wait for the backoff window
+        if: ${{ steps.slot.outputs.run == 'true' && steps.slot.outputs.wait_minutes != '0' }}
+        run: |
+          echo "sleeping ${{ steps.slot.outputs.wait_minutes }} min before attempt ${{ steps.slot.outputs.attempt }}"
+          sleep $(( ${{ steps.slot.outputs.wait_minutes }} * 60 ))
+
+      - name: Checkout the pipeline
+        if: ${{ steps.slot.outputs.run == 'true' }}
+        uses: actions/checkout@v4
+        with:
+          repository: swimmingliu/auto-vpn
+          ref: ${{ env.PIPELINE_REF }}
+          path: source
+
       - name: Check required configuration
+        if: ${{ steps.slot.outputs.run == 'true' }}
         env:
           CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CF_ACCOUNT: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
@@ -88,6 +138,7 @@ jobs:
       # on CLI behaviour that a published version may not carry yet, and the
       # workflow and the CLI must be the same commit.
       - name: Build the CLI from the pinned checkout
+        if: ${{ steps.slot.outputs.run == 'true' }}
         run: |
           npm --prefix npm/autovpn-cli ci --no-audit --no-fund --ignore-scripts
           npm --prefix npm/autovpn-cli run build
@@ -95,6 +146,7 @@ jobs:
           autovpn --version
 
       - name: Install mihomo
+        if: ${{ steps.slot.outputs.run == 'true' }}
         run: |
           cloudflare/scripts/fetch-mihomo.sh "$MIHOMO_VERSION"
           install -m 0755 cloudflare/container/vendor/mihomo-linux-amd64 "$RUNNER_TEMP/mihomo"
@@ -106,6 +158,7 @@ jobs:
       # required and must leave at least one active account — a pool that
       # synced but cannot lease fails one step later, inside the crawl.
       - name: Sync the account pool from the shared database
+        if: ${{ steps.slot.outputs.run == 'true' }}
         env:
           VPN_AUTOMATION_RUNTIME_ROOT: ${{ runner.temp }}/autovpn
           AUTOVPN_ACCOUNTS_DB_URL: ${{ secrets.AUTOVPN_ACCOUNTS_DB_URL }}
@@ -131,6 +184,7 @@ jobs:
       # supervisor process is what keeps mihomo alive, so it runs in the
       # background for the rest of the job.
       - name: Build the crawl egress from the published subscription
+        if: ${{ steps.slot.outputs.run == 'true' }}
         env:
           SUBSCRIPTION_URL: ${{ secrets.AUTOVPN_SUBSCRIPTION_URL }}
           MIHOMO_BIN: ${{ runner.temp }}/mihomo
@@ -153,6 +207,7 @@ jobs:
 
       - name: Measure
         id: measure
+        if: ${{ steps.slot.outputs.run == 'true' }}
         env:
           VPN_AUTOMATION_RUNTIME_ROOT: ${{ runner.temp }}/autovpn
           VPN_AUTOMATION_PROFILE_PATH: ${{ github.workspace }}/source/cloudflare/container/profile.cloudflare.toml
@@ -189,12 +244,12 @@ jobs:
           ' "$RUNNER_TEMP/run.jsonl" cloudflare/container/profile.cloudflare.toml
 
       - name: Report a held night
-        if: ${{ steps.measure.outputs.held == 'true' }}
+        if: ${{ steps.slot.outputs.run == 'true' && steps.measure.outputs.held == 'true' }}
         run: |
           echo "::notice::final_links=${{ steps.measure.outputs.final_links }} did not clear the floor; nothing was published and the previous subscription stays in service"
 
       - name: Publish
-        if: ${{ inputs.dry_run != true && steps.measure.outputs.held != 'true' }}
+        if: ${{ steps.slot.outputs.run == 'true' && inputs.dry_run != true && steps.measure.outputs.held != 'true' }}
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
@@ -237,7 +292,8 @@ jobs:
       # A 200 is not success: a wrong key and a stale deployment answer 200 too.
       # Decode the body and require this run's own links to be in it.
       - name: Verify what is actually served
-        if: ${{ inputs.dry_run != true && steps.measure.outputs.held != 'true' }}
+        id: verify
+        if: ${{ steps.slot.outputs.run == 'true' && inputs.dry_run != true && steps.measure.outputs.held != 'true' }}
         env:
           # The profile holds the sentinel, not the key; the value the deploy
           # actually used comes from the same secret the publish step read.
@@ -277,8 +333,32 @@ jobs:
             fi
           done
 
+      # The ladder's next slot. Dispatched at the end of an attempt so the pause
+      # is measured from when the crawl finished, and only when this attempt did
+      # not publish: the gate the child re-reads would turn a post-publish
+      # dispatch into a no-op anyway, but not spending the dispatch keeps the
+      # run list honest about how many chances the night actually took.
+      - name: Chain the next slot
+        if: ${{ always() && steps.slot.outputs.run == 'true' && steps.slot.outputs.chain == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ATTEMPT: ${{ steps.slot.outputs.attempt }}
+          PUBLISHED_HERE: ${{ steps.verify.outcome == 'success' }}
+        run: |
+          payload="$(node runner/scripts/publish-retry-gate.mjs --next --attempt "$ATTEMPT")"
+          # A run that already published has nothing left to chain; the
+          # successor would read the publish and exit, but not firing it keeps
+          # the log readable.
+          if [ "$PUBLISHED_HERE" = "true" ]; then
+            echo "this attempt published; the ladder ends here"
+            exit 0
+          fi
+          echo "dispatching the next slot with $payload"
+          printf '{"event_type":"subscription-publish-retry","client_payload":%s}' "$payload" \
+            | gh api --method POST "repos/${GITHUB_REPOSITORY}/dispatches" --input -
+
       - name: Upload the run log
-        if: always()
+        if: ${{ always() && steps.slot.outputs.run == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: subscription-publish-run
