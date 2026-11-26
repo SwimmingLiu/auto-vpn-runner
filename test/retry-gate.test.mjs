@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import {
   BASE_BACKOFF_MS,
@@ -465,34 +466,42 @@ test('a crawl cancelled during Measure is still an attempt', async () => {
   assert.equal(decision.waitMinutes, 20);
 });
 
-test('a run of slots that die before measuring stops the ladder', async () => {
+test('a stall streak never withholds the chain from a slot that might recover', async () => {
   // Spending nothing is right for a transient 5xx and a run storm for a
-  // misconfiguration: each dead slot hands on with no pause, so nothing else
-  // would ever stop it.
+  // misconfiguration — but enforcing the cutoff here ended the night on the
+  // third slot, which is the one that measured and proved the blip was over.
+  // The cutoff belongs to the handoff, the only place that knows the slot died.
   const { fetchImpl } = fakeApi([]);
   const decision = await decide({
     ...base,
     eventName: 'repository_dispatch',
-    payload: { attempt: 1, stalled: 2 },
+    payload: { attempt: 1, stalled: 5 },
     nowMs: ANCHOR + 10 * MINUTE,
     fetchImpl
   });
   assert.equal(decision.run, true, 'the slot still gets its chance');
-  assert.equal(decision.chain, false, 'a permanent pre-measure failure must not hand on forever');
-  assert.match(decision.reason, /died before measuring/);
+  assert.equal(decision.chain, true, 'a slot that recovers must be allowed to hand on');
 });
 
-test('one dead slot does not stop the ladder', async () => {
-  const { fetchImpl } = fakeApi([]);
-  const decision = await decide({
-    ...base,
-    eventName: 'repository_dispatch',
-    payload: { attempt: 1, stalled: 1 },
-    nowMs: ANCHOR + 10 * MINUTE,
-    fetchImpl
-  });
-  assert.equal(decision.run, true);
-  assert.equal(decision.chain, true);
+test('the handoff refuses to extend a stall streak past the limit', async () => {
+  const { execFileSync, spawnSync } = await import('node:child_process');
+  const script = new URL('../scripts/publish-retry-gate.mjs', import.meta.url);
+  const allowed = JSON.parse(
+    execFileSync(process.execPath, [fileURLToPath(script), '--handoff', '--attempt', '5', '--stalled', '2'], { encoding: 'utf8' })
+  );
+  assert.equal(allowed.attempt, 5, 'a handoff inside the limit keeps the slot');
+  assert.equal(allowed.stalled, 2);
+
+  const refused = spawnSync(process.execPath, [fileURLToPath(script), '--handoff', '--attempt', '5', '--stalled', '3'], { encoding: 'utf8' });
+  assert.equal(refused.status, 3, 'a fourth slot in a row must not be dispatched');
+  assert.equal(refused.stdout.trim(), '', 'a refused handoff still printed a payload');
+  assert.match(refused.stderr, /died before measuring/);
+});
+
+test('a measured run resets the streak', () => {
+  // `--next` carries no streak, so a slot that measured and failed cannot
+  // inherit a previous stall and stop the ladder one hop later.
+  assert.equal(Object.prototype.hasOwnProperty.call(nextSlotPayload({ attempt: 3, nowMs: ANCHOR }), 'stalled'), false);
 });
 
 test('a crawl that failed is an attempt', async () => {
@@ -657,6 +666,18 @@ test('a rate-limited 403 is retried, a permission 403 is not', async () => {
   assert.equal(decision.run, true, 'a rate-limited 403 ended the ladder');
   assert.equal(calls, 2, 'the rate-limited call was not retried');
 
+  // The primary limit answers 403 with the remaining count at zero instead of
+  // a retry-after header.
+  let primaryCalls = 0;
+  const primary = async (url, init) => {
+    primaryCalls += 1;
+    if (primaryCalls === 1) return limited({ 'x-ratelimit-remaining': '0' })(url);
+    return healthy(url, init);
+  };
+  const primaryDecision = await decide({ ...base, nowMs: ANCHOR + MINUTE, fetchImpl: primary });
+  assert.equal(primaryDecision.run, true, 'a primary rate limit ended the ladder');
+  assert.equal(primaryCalls, 2, 'the primary-limited call was not retried');
+
   let permissionCalls = 0;
   const permission = async (url) => {
     permissionCalls += 1;
@@ -758,7 +779,6 @@ test('the gate runs when node is given a symlinked path to it', async () => {
   const { execFileSync } = await import('node:child_process');
   const os = await import('node:os');
   const path = await import('node:path');
-  const { fileURLToPath } = await import('node:url');
   const dir = mkdtempSync(path.join(os.tmpdir(), 'gate-link-'));
   const link = path.join(dir, 'gate.mjs');
   symlinkSync(fileURLToPath(new URL('../scripts/publish-retry-gate.mjs', import.meta.url)), link);

@@ -423,9 +423,15 @@ jobs:
             # night an attempt it never took and start the next pause early.
             #
             # The streak is carried: spending nothing is right for a blip and
-            # a run storm for a misconfiguration, so the gate stops chaining
-            # after a few in a row.
-            payload="$(node runner/scripts/publish-retry-gate.mjs --handoff --attempt "$ATTEMPT" --stalled "$(( STALLED + 1 ))")"
+            # a run storm for a misconfiguration, so the handoff refuses to
+            # extend it past the limit. The cutoff lives here and not in the
+            # decision: a slot that recovers and measures must still chain.
+            status=0
+            payload="$(node runner/scripts/publish-retry-gate.mjs --handoff --attempt "$ATTEMPT" --stalled "$(( STALLED + 1 ))")" || status=$?
+            if [ "$status" -ne 0 ]; then
+              echo "::error::this slot and the ones before it keep dying before measuring; the ladder stops here"
+              exit 1
+            fi
           else
             payload="$(node runner/scripts/publish-retry-gate.mjs --next --attempt "$ATTEMPT")"
           fi

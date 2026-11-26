@@ -114,6 +114,11 @@ export const ATTEMPT_EVENTS = Object.freeze(['schedule', 'repository_dispatch'])
  * hand on forever at full speed: the one failure mode where "spends nothing"
  * turns into a run storm. Three is enough to ride out a blip and few enough
  * that a misconfiguration ends as three red runs.
+ *
+ * Enforced by `--handoff`, which is the only thing that knows a slot died
+ * before measuring. A slot that recovers and measures is chained by `--next`
+ * and carries no streak, so the cutoff can never take a working night's
+ * ladder away.
  */
 export const MAX_STALLED_PRE_MEASURE = 2;
 
@@ -387,11 +392,6 @@ export async function decide(options) {
   // inside this window can speak for this window.
   const payloadInCampaign = Boolean(parentRun) && Date.parse(String(parentRun.createdAt ?? '')) >= startMs;
 
-  // Consecutive slots that died before reaching Measure. A transient failure
-  // hands on without spending a chance; a permanent one must not do that
-  // forever.
-  const stalled = Math.max(0, Number(payload?.stalled ?? 0) || 0);
-
   const chainedAttempt = payloadInCampaign ? Number(payload?.attempt ?? 0) : 0;
   // The payload is a hint, the history is the record: a cron slot that crawled
   // while this one sat queued must not let the number go backwards.
@@ -432,15 +432,13 @@ export async function decide(options) {
     // nothing to chain: the next slot would only read the window, say so, and
     // exit. A dispatch that is known to be a no-op is one more row on the run
     // list for no chance at all.
-    const inWindow = nowMs + backoffAfter(attempt) < endMs;
-    const stalledOut = stalled >= MAX_STALLED_PRE_MEASURE;
-    const chain = inWindow && !stalledOut;
+    const chain = nowMs + backoffAfter(attempt) < endMs;
     const base = attempt === 1
       ? 'first attempt of the campaign'
       : `attempt ${attempt} of ${maxAttempts}` + (waitMinutes > 0 ? `, after a ${waitMinutes} min pause` : '');
-    let reason = base;
-    if (!inWindow) reason = `${base}; the next pause would land past the campaign's end, so this is the last slot`;
-    else if (stalledOut) reason = `${base}; ${stalled} slots in a row have died before measuring, so the ladder stops here`;
+    const reason = chain
+      ? base
+      : `${base}; the next pause would land past the campaign's end, so this is the last slot`;
     return {
       run: true,
       waiter: false,
@@ -517,7 +515,16 @@ async function main() {
   }
   if (args.handoff) {
     // A waiter hands on the slot it was given, untouched. A slot that died
-    // before measuring also carries how many in a row have.
+    // before measuring also carries how many in a row have — and this is the
+    // only place that knows a slot died without measuring, so the cutoff for a
+    // streak belongs here rather than in the decision: a slot that recovered
+    // and measured must still be able to chain.
+    if (args.stalled > MAX_STALLED_PRE_MEASURE) {
+      process.stderr.write(
+        `retry gate: ${args.stalled} slots in a row have died before measuring; the ladder stops here\n`
+      );
+      process.exit(3);
+    }
     process.stdout.write(`${JSON.stringify(handoffPayload({ attempt: args.attempt, dueAt: args.dueAt, stalled: args.stalled }))}\n`);
     return;
   }

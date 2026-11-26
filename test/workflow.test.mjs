@@ -261,6 +261,11 @@ test('a redaction failure leaves nothing for the upload to publish', () => {
   assert.match(redact.body, /leaked=1/, 'the guard exits on the first match instead of checking every file');
   assert.match(
     redact.body,
+    /for f in "\$RUNNER_TEMP"\/run\.redacted\.jsonl "\$RUNNER_TEMP"\/deploy\.redacted\.jsonl; do/,
+    'the deploy log is never examined for leaks'
+  );
+  assert.match(
+    redact.body,
     /rm -f "\$RUNNER_TEMP"\/run\.redacted\.jsonl "\$RUNNER_TEMP"\/deploy\.redacted\.jsonl/,
     'only the file that matched is removed; the unexamined sibling is still uploaded'
   );
@@ -286,6 +291,13 @@ test('a gate that cannot read the history fails the run visibly', () => {
     /if \[ "\$status" -ne 0 \]; then[\s\S]*?exit "\$status"/,
     'the annotation is not on the branch that fails the step'
   );
+  // Without the capture, `|| true` in place of `|| status=$?` leaves the step
+  // green with run=false and the night silently skips.
+  assert.match(
+    gate.body,
+    /publish-retry-gate\.mjs[\s\S]*?\|\|\s*status=\$\?/,
+    'the gate\'s exit status is discarded; a fail-closed slot reads as a green skip'
+  );
 });
 
 test('the configuration check names the secrets the crawl needs', () => {
@@ -304,6 +316,18 @@ test('a dead slot carries its streak so a misconfiguration cannot storm', () => 
   assert.ok(chain, 'nothing dispatches the next slot');
   assert.match(chain.body, /--stalled/, 'a slot that dies before measuring never counts how many have');
   assert.match(chain.body, /STALLED: \$\{\{ github\.event\.client_payload\.stalled \|\| 0 \}\}/, 'the streak is not read from the payload');
+  // The refusal is a non-zero exit from the handoff; without the capture the
+  // step would go green having dispatched nothing.
+  assert.match(
+    chain.body,
+    /--handoff[\s\S]*?\|\|\s*status=\$\?/,
+    'the handoff\'s refusal is discarded; a permanent failure would end as a green skip'
+  );
+  assert.match(
+    chain.body,
+    /if \[ "\$status" -ne 0 \][\s\S]*?exit 1/,
+    'the streak refusal does not fail the run'
+  );
 });
 
 test('a skipped slot does not try to redact logs it never produced', () => {
